@@ -312,10 +312,16 @@ svg .bar.sel{fill:var(--bar-sel)}
 const CONFIG = {
   SHEET_ID: "16DLNehsisZT8EgAsphM4l0Q6QsWFHiPAMpIFhEJfUqc",
   ABA_CRONOGRAMA: "CRONOGRAMA",
-  DESTINOS: ["Itajaí", "Londrina"],
-  JANELA: {antes: 1, depois: 6},          // dias varridos em torno de hoje
-  // padrão de nome das abas de envio: "10/09 Itajaí Envio"
-  padraoAba: (dd, mm, destino) => dd + "/" + mm + " " + destino + " Envio"
+  // Chave de API do Google (só leitura de planilhas públicas).
+  // Com ela a página lê a LISTA REAL de abas e ignora as ocultas.
+  // Sem ela, cai no modo reserva: adivinha nomes por data e não sabe o que está oculto.
+  API_KEY: "",
+  DESTINOS: ["Itajaí", "Londrina"],       // usados só no modo reserva
+  JANELA: {antes: 1, depois: 6},          // idem — dias varridos em torno de hoje
+  MAX_ABAS: 20,                           // teto de abas de envio lidas por varredura
+  // nome das abas de envio: "10/09 Itajaí Envio"
+  padraoAba: (dd, mm, destino) => dd + "/" + mm + " " + destino + " Envio",
+  regexAba: /^\s*(\d{1,2})\/(\d{1,2})\s+(.+?)\s+Envio\s*$/i
 };
 
 /* O gviz NÃO devolve erro para aba inexistente: ele entrega a PRIMEIRA aba
@@ -328,6 +334,33 @@ function hash(str){
   let h = 5381;
   for(let i=0;i<str.length;i++) h = ((h<<5) + h + str.charCodeAt(i)) | 0;
   return h + ":" + str.length;
+}
+/* Lista real das abas, com o sinalizador de oculta. Só a API do Sheets
+   entrega isso — o gviz não sabe dizer o que está oculto. */
+async function listarAbas(){
+  if(!CONFIG.API_KEY) return null;
+  const u = "https://sheets.googleapis.com/v4/spreadsheets/" + CONFIG.SHEET_ID +
+            "?fields=sheets.properties(sheetId,title,hidden,index)&key=" + encodeURIComponent(CONFIG.API_KEY);
+  const r = await fetch(u, {cache:"no-store"});
+  if(!r.ok){
+    let det = "HTTP " + r.status;
+    try{ const j = await r.json(); if(j.error && j.error.message) det = j.error.message; }catch(e){}
+    throw new Error(det);
+  }
+  const j = await r.json();
+  return (j.sheets || []).map(x => x.properties)
+    .map(p => ({gid: p.sheetId, titulo: p.title, oculta: p.hidden === true, ordem: p.index}));
+}
+function urlGid(gid){
+  return "https://docs.google.com/spreadsheets/d/" + CONFIG.SHEET_ID +
+         "/gviz/tq?tqx=out:csv&gid=" + encodeURIComponent(gid);
+}
+async function baixarGid(gid){                 // por gid é exato: não existe queda para a 1ª aba
+  const r = await fetch(urlGid(gid), {cache:"no-store"});
+  if(!r.ok) throw new Error("HTTP " + r.status);
+  const txt = new TextDecoder("utf-8").decode(await r.arrayBuffer());
+  if(/^\s*</.test(txt)) throw new Error("planilha sem acesso público");
+  return txt;
 }
 function urlAba(nome){
   return "https://docs.google.com/spreadsheets/d/" + CONFIG.SHEET_ID +
@@ -982,7 +1015,69 @@ function candidatos(){
   return out;
 }
 
+/* Uma varredura mais nova invalida a anterior: sem isso, uma varredura lenta
+   ainda em andamento sobrescreve o resultado da que o usuário acabou de pedir. */
+let scanAtual = 0;
 async function varrer(forcar){
+  const meu = ++scanAtual;
+  return CONFIG.API_KEY ? varrerPelaLista(meu) : varrerAdivinhando(forcar, meu);
+}
+const vivo = meu => meu === scanAtual;
+
+/* Modo padrão: lista real de abas, só as VISÍVEIS. */
+async function varrerPelaLista(meu){
+  const st = $("#sheets-status"), box = $("#varredura");
+  st.textContent = "lendo as abas…";
+  box.innerHTML = '<p class="empty">Lendo a lista de abas da planilha…</p>';
+  let abas;
+  try{ abas = await listarAbas(); }
+  catch(e){
+    st.textContent = "lista de abas indisponível";
+    box.innerHTML = '<div class="msg err">Não consegui listar as abas: ' + esc(e.message) +
+      '. Confira a chave de API em <span class="mono">CONFIG.API_KEY</span> e se a planilha está ' +
+      'compartilhada como "qualquer pessoa com o link — leitor". Caindo para a varredura por data…</div>';
+    return varrerAdivinhando(true, meu);
+  }
+  const visiveis = abas.filter(a => !a.oculta);
+  const ocultas = abas.length - visiveis.length;
+  const envios = visiveis
+    .map(a => ({a, m: a.titulo.match(CONFIG.regexAba)}))
+    .filter(x => x.m)
+    .map(x => ({
+      gid: x.a.gid, titulo: x.a.titulo,
+      destino: x.m[3].trim(),
+      data: completarAno(x.m[1].padStart(2,"0") + "/" + x.m[2].padStart(2,"0"))
+    }))
+    .sort((p,q) => (dObj(q.data)||0) - (dObj(p.data)||0))
+    .slice(0, CONFIG.MAX_ABAS);
+
+  let achados = 0, erro = null;
+  const alvo = document.createElement("div");
+  for(const e of envios){
+    if(!vivo(meu)) return;
+    try{
+      const txt = await baixarGid(e.gid);
+      const r = importar(txt, {destino: e.destino, data: e.data, origem: e.titulo, alvo});
+      if(r && r.tipo === "envio") achados++;
+    }catch(err){ erro = err.message; }
+  }
+  const crono = visiveis.find(a => a.titulo.trim().toUpperCase() === CONFIG.ABA_CRONOGRAMA);
+  if(crono){
+    try{ importar(await baixarGid(crono.gid), {origem: crono.titulo, alvo}); }catch(err){}
+  }
+  if(!vivo(meu)) return;
+  renderAll();
+  st.textContent = achados + " de " + envios.length + " aba(s) de envio visíveis" +
+    (ocultas ? " · " + ocultas + " oculta(s) ignorada(s)" : "");
+  box.innerHTML = resumoVarredura(achados, erro,
+    envios.length ? null : "Nenhuma aba visível com o padrão <span class=\"mono\">dd/mm Destino Envio</span>. " +
+      abas.length + " abas na planilha, " + ocultas + " ocultas.");
+}
+
+/* Modo reserva (sem chave de API): adivinha nomes por data.
+   Não enxerga o que está oculto — abas ocultas com nome no padrão entram. */
+async function varrerAdivinhando(forcar, meu){
+  if(meu === undefined) meu = ++scanAtual;
   const st = $("#sheets-status"), box = $("#varredura");
   const miss = forcar ? {} : lerMiss();
   const lista = candidatos();
@@ -998,6 +1093,7 @@ async function varrer(forcar){
     return;
   }
   for(const c of lista){
+    if(!vivo(meu)) return;
     if(miss[c.aba]) continue;
     try{
       const txt = await baixarAba(c.aba);
@@ -1009,21 +1105,23 @@ async function varrer(forcar){
     }
   }
   gravarMiss(miss);
+  if(!vivo(meu)) return;
   renderAll();
   st.textContent = achados + " envio(s) na janela de " +
-    (CONFIG.JANELA.antes + CONFIG.JANELA.depois + 1) + " dias";
-  box.innerHTML = resumoVarredura(achados, erro);
+    (CONFIG.JANELA.antes + CONFIG.JANELA.depois + 1) + " dias · sem filtro de abas ocultas";
+  box.innerHTML = resumoVarredura(achados, erro,
+    'Modo reserva: sem <span class="mono">CONFIG.API_KEY</span> não dá para saber quais abas estão ' +
+    'ocultas, então a busca é por nome de aba dentro da janela de datas.');
 }
 
-function resumoVarredura(achados, erro){
+function resumoVarredura(achados, erro, nota){
   const daPlanilha = state.envios.filter(e => e.origem && e.origem !== "colado");
   let h = "";
   if(erro) h += '<div class="msg err">Algumas abas falharam: ' + esc(erro) + '</div>';
+  if(nota) h += '<p class="empty">' + nota + '</p>';
   if(!daPlanilha.length){
-    return h + '<p class="empty">Nenhuma aba de envio encontrada entre ' +
-      'hoje−' + CONFIG.JANELA.antes + ' e hoje+' + CONFIG.JANELA.depois + '. ' +
-      'As abas precisam seguir o padrão <span class="mono">dd/mm Destino Envio</span>. ' +
-      'Use "Carregar uma data específica" ou a entrada manual.</p>';
+    return h + (nota ? "" : '<p class="empty">Nenhuma aba de envio encontrada. ' +
+      'Use "Carregar uma data específica" ou a entrada manual.</p>');
   }
   h += '<div class="envios-grid">' + daPlanilha
     .sort((a,b) => (dObj(a.data)||0) - (dObj(b.data)||0))
@@ -1078,6 +1176,7 @@ document.addEventListener("click", async ev => {
   document.head.appendChild(l);
 })();
 
+if(window.__PRESET_KEY) CONFIG.API_KEY = window.__PRESET_KEY;   // usado só nos testes
 load(); renderAll(); varrer(false);
 if(window.claude && claude.use) claude.use("downloads").then(d => { downloads = d; }).catch(()=>{});
 </script>
