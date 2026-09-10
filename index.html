@@ -139,6 +139,14 @@ tbody tr:hover td{background:var(--accent-soft)}
 .pill.c{background:var(--crit-soft);color:var(--crit)}
 .pill.g{background:var(--good-soft);color:var(--good)}
 
+.seg{display:flex;gap:6px;flex-wrap:wrap}
+.seg .btn[aria-pressed="true"]{background:#212121;border-color:#212121;color:#fff}
+:root[data-theme="dark"] .seg .btn[aria-pressed="true"],
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]) .seg .btn[aria-pressed="true"]{
+  background:var(--lime);border-color:var(--lime);color:#212121}}
+.rel-topo{display:flex;flex-wrap:wrap;gap:14px;align-items:center;justify-content:space-between;margin-bottom:16px}
+.rel-cols{display:grid;grid-template-columns:1fr 1fr;gap:24px;margin-top:20px}
+@media (max-width:900px){.rel-cols{grid-template-columns:1fr}}
 .envios-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(288px,1fr));gap:14px}
 .env{border:1px solid var(--line);border-radius:var(--radius);background:var(--surface);
   padding:18px;display:flex;flex-direction:column;gap:14px;position:relative;overflow:hidden}
@@ -275,6 +283,18 @@ svg .bar.sel{fill:var(--bar-sel)}
     </div>
   </section>
 
+  <section class="card" id="card-rel">
+    <div class="head"><h2>Relatório do período</h2>
+      <div class="seg" id="seg-periodo" role="group" aria-label="Período">
+        <button class="btn sm" data-dias="7">7 dias</button>
+        <button class="btn sm" data-dias="15">15 dias</button>
+        <button class="btn sm" data-dias="30" aria-pressed="true">30 dias</button>
+        <button class="btn sm" data-dias="0">tudo</button>
+      </div>
+    </div>
+    <div class="body"><div id="relatorio"></div></div>
+  </section>
+
   <div class="dupla">
   <section class="card" id="card-crono">
     <div class="head"><h2>Cronograma de envios</h2>
@@ -313,8 +333,13 @@ svg .bar.sel{fill:var(--bar-sel)}
 const CONFIG = {
   SHEET_ID: "16DLNehsisZT8EgAsphM4l0Q6QsWFHiPAMpIFhEJfUqc",
   ABA_CRONOGRAMA: "CRONOGRAMA",
-  DESTINOS: ["Itajaí", "Londrina"],
-  JANELA: {antes: 1, depois: 6},          // dias varridos em torno de hoje
+  // Ponte de leitura (Apps Script publicado na planilha). Com ela a página lê
+  // TODAS as abas, sem limitador e sem problema de CORS. Sem ela, sobra o
+  // caminho antigo — adivinhar nomes de aba por data — que depende do gviz
+  // liberar CORS e não enxerga aba nenhuma fora da janela de datas.
+  WEBAPP_URL: "",
+  DESTINOS: ["Itajaí", "Londrina"],       // usados só no caminho de reserva
+  JANELA: {antes: 1, depois: 6},          // idem
   // nome das abas de envio: "10/09 Itajaí Envio"
   padraoAba: (dd, mm, destino) => dd + "/" + mm + " " + destino + " Envio",
   padraoNome: /^\s*(\d{1,2})\/(\d{1,2})\s+(.+?)\s+Envio\s*$/i
@@ -340,6 +365,20 @@ function assinatura(texto){
     if(c){ mls.push((c.match(reML) || [])[1]); if(mls.length === 5) break; }
   }
   return cab + "|" + mls.join(",");
+}
+async function ponteEnvios(dias){
+  const u = CONFIG.WEBAPP_URL + (CONFIG.WEBAPP_URL.indexOf("?") === -1 ? "?" : "&") +
+            "acao=envios&dias=" + (dias || 0);
+  const r = await fetch(u, {cache:"no-store", redirect:"follow"});
+  if(!r.ok) throw new Error("HTTP " + r.status);
+  const j = await r.json();
+  if(j.erro) throw new Error(j.erro);
+  return j.abas || [];
+}
+/* O web app devolve matriz de células; a página trabalha com texto tabular. */
+function matrizParaCsv(valores){
+  return (valores || []).map(l => l.map(c => '"' + String(c == null ? "" : c).replace(/"/g,'""') + '"')
+                                   .join(",")).join("\n");
 }
 function urlAba(nome){
   return "https://docs.google.com/spreadsheets/d/" + CONFIG.SHEET_ID +
@@ -498,10 +537,6 @@ function auditar(env){
     t: "Total divergente: planilha " + env.totalDecl + " × lista " + un +
        " (" + (env.totalDecl > un ? "+" : "") + (env.totalDecl - un) + ")",
     d: "O sistema vai reconhecer o total da planilha. Resolva antes de subir."});
-  if(env.meta && env.meta.dataDecl && env.data &&
-     fmt(completarAno(env.meta.dataDecl)) !== fmt(env.data)) a.push({k:"w",
-    t: "Nome da aba " + fmt(env.data) + " × cabeçalho " + fmt(completarAno(env.meta.dataDecl)),
-    d: "Estou usando a data do nome da aba. Vale corrigir o cabeçalho na planilha para os dois baterem."});
   const porEan = {};
   env.itens.forEach(i => {
     if(!i.uni || /^N\/?A$/i.test(i.uni)) return;
@@ -854,12 +889,9 @@ function importar(texto, opts){
        reserva, e a diferença entre os dois vira aviso na conferência. */
     const dataAba = p.dataDecl ? completarAno(p.dataDecl) : null;
     const dataNome = (opts.data || $("#data").value || "").trim();
-    /* Muitas abas têm o cabeçalho de data desatualizado, então ele não pode
-       eliminar a aba — só informar. Quando o cabeçalho e o nome da aba
-       discordam, vale o NOME (que é como a operação chama o envio) e a
-       diferença aparece na conferência. */
-    const usarNome = !!(opts.origem && dataNome && dataAba && fmt(dataAba) !== fmt(dataNome));
-    const data = (usarNome ? dataNome : dataAba) || dataNome ||
+    /* A data do envio é a do nome da aba. O cabeçalho da planilha está
+       desatualizado em boa parte das abas e não é cruzado com nada. */
+    const data = dataNome || dataAba ||
       fmt(new Date().getDate() + "/" + (new Date().getMonth()+1) + "/" + new Date().getFullYear());
     const id = slug(destino) + "-" + slug(data) + "-" + Date.now().toString(36);
     state.envios = state.envios.filter(e => !(slug(e.destino) === slug(destino) && fmt(e.data) === fmt(data)));
@@ -887,6 +919,102 @@ function importar(texto, opts){
 }
 
 /* ---------- eventos ---------- */
+/* ---------- relatório por período ---------- */
+let relDias = 30;
+
+function janelaRel(dias){
+  const t = hoje0();
+  const ini = dias > 0 ? new Date(t.getTime() - (dias - 1) * 86400000) : null;
+  return state.envios.filter(e => {
+    const d = dObj(e.data);
+    return d && (!ini || d >= ini) && d <= t;      // período fechado: até hoje
+  }).sort((a,b) => (dObj(b.data)||0) - (dObj(a.data)||0));
+}
+
+function renderRel(){
+  document.querySelectorAll("#seg-periodo .btn").forEach(b =>
+    b.setAttribute("aria-pressed", String(+b.dataset.dias === relDias)));
+  const el = $("#relatorio"), envios = janelaRel(relDias);
+  const rotulo = relDias ? "últimos " + relDias + " dias" : "período completo";
+  if(!envios.length){
+    el.innerHTML = '<p class="empty">Nenhum envio com data dentro dos ' + rotulo +
+      '. Envios futuros não entram no relatório — ele fecha em hoje.</p>';
+    return;
+  }
+  const un = envios.reduce((s,e) => s + e.itens.reduce((x,i)=>x+i.qtd,0), 0);
+  const linhas = envios.reduce((s,e) => s + e.itens.length, 0);
+  const arqs = envios.reduce((s,e) => s + lotes(e.itens).length, 0);
+  const dias = new Set(envios.map(e => fmt(e.data))).size;
+
+  const porDest = {};
+  envios.forEach(e => {
+    const k = e.destino || "—";
+    (porDest[k] = porDest[k] || {envios:0, un:0, linhas:0});
+    porDest[k].envios++; porDest[k].un += e.itens.reduce((x,i)=>x+i.qtd,0);
+    porDest[k].linhas += e.itens.length;
+  });
+  const porSku = {};
+  envios.forEach(e => e.itens.forEach(i => {
+    (porSku[i.sku] = porSku[i.sku] || {un:0, envios:new Set(), desc:i.desc});
+    porSku[i.sku].un += i.qtd; porSku[i.sku].envios.add(e.id);
+  }));
+  const topSku = Object.keys(porSku).map(k => ({sku:k, ...porSku[k]}))
+    .sort((a,b) => b.un - a.un).slice(0, 12);
+
+  let h = '<div class="rel-topo"><span class="eyebrow">' + rotulo + ' · ' +
+    fmt(envios[envios.length-1].data) + ' a ' + fmt(envios[0].data) + '</span>' +
+    '<button class="btn sm" id="btn-rel-csv">Baixar relatório (.csv)</button></div>';
+
+  h += '<div class="kpis">' +
+    kpi(un.toLocaleString("pt-BR"), "unidades", true) +
+    kpi(envios.length, envios.length === 1 ? "envio" : "envios") +
+    kpi(dias, dias === 1 ? "dia com envio" : "dias com envio") +
+    kpi(linhas, "linhas") +
+    kpi(arqs, "arquivos gerados") +
+    kpi(Math.round(un / dias).toLocaleString("pt-BR"), "un / dia") +
+    '</div>';
+
+  h += '<div class="rel-cols"><div>' +
+    '<h3 style="font-size:15px;margin-bottom:10px">Por destino</h3><div class="scroll"><table><thead><tr>' +
+    '<th>Destino</th><th class="num">Envios</th><th class="num">Unidades</th><th class="num">Linhas</th>' +
+    '</tr></thead><tbody>' +
+    Object.keys(porDest).sort((a,b) => porDest[b].un - porDest[a].un).map(k =>
+      '<tr><td>' + esc(k) + '</td><td class="num">' + porDest[k].envios + '</td>' +
+      '<td class="num">' + porDest[k].un.toLocaleString("pt-BR") + '</td>' +
+      '<td class="num">' + porDest[k].linhas + '</td></tr>').join("") +
+    '</tbody></table></div>' +
+    '<h3 style="font-size:15px;margin:20px 0 10px">Envios</h3><div class="scroll"><table><thead><tr>' +
+    '<th>Data</th><th>Destino</th><th class="num">Un</th><th class="num">Lotes</th>' +
+    '</tr></thead><tbody>' +
+    envios.map(e => '<tr><td class="mono">' + fmt(e.data) + '</td><td>' + esc(e.destino) +
+      '</td><td class="num">' + e.itens.reduce((x,i)=>x+i.qtd,0).toLocaleString("pt-BR") +
+      '</td><td class="num">' + lotes(e.itens).length + '</td></tr>').join("") +
+    '</tbody></table></div></div><div>' +
+    '<h3 style="font-size:15px;margin-bottom:10px">SKUs de maior volume</h3><div class="scroll"><table><thead><tr>' +
+    '<th>SKU</th><th class="num">Un</th><th class="num">Envios</th><th>Produto</th>' +
+    '</tr></thead><tbody>' +
+    topSku.map(x => '<tr><td class="mono">' + esc(x.sku) + '</td><td class="num">' +
+      x.un.toLocaleString("pt-BR") + '</td><td class="num">' + x.envios.size + '</td><td>' +
+      esc((x.desc || "").slice(0, 46)) + '</td></tr>').join("") +
+    '</tbody></table></div></div></div>';
+  el.innerHTML = h;
+
+  $("#btn-rel-csv").addEventListener("click", () => {
+    let csv = "RELATORIO SEPARACAO FULL;" + rotulo + "\n";
+    csv += "data;destino;aba;numero do envio;linhas;unidades;lotes\n";
+    envios.forEach(e => {
+      csv += [fmt(e.data), e.destino, e.origem || "manual",
+              (e.meta && e.meta.envioNum) || "", e.itens.length,
+              e.itens.reduce((x,i)=>x+i.qtd,0), lotes(e.itens).length].join(";") + "\n";
+    });
+    csv += "\nTOTAL;;;;" + linhas + ";" + un + ";" + arqs + "\n";
+    csv += "\nsku;unidades;envios;produto\n";
+    Object.keys(porSku).sort((a,b) => porSku[b].un - porSku[a].un).forEach(k =>
+      csv += [k, porSku[k].un, porSku[k].envios.size, (porSku[k].desc || "").replace(/;/g, ",")].join(";") + "\n");
+    baixar("RELATORIO_FULL_" + (relDias || "TUDO") + "D", csv, $("#relatorio"));
+  });
+}
+
 function renderBanda(){
   const daPlanilha = state.envios.filter(e => e.origem && e.origem !== "colado");
   const un = state.envios.reduce((s,e) => s + e.itens.reduce((x,i)=>x+i.qtd,0), 0);
@@ -898,7 +1026,7 @@ function renderBanda(){
     '<div class="s"><div class="sv">' + arqs + '</div><div class="sk">arquivos</div></div>' +
     (pend ? '<div class="s"><div class="sv" style="color:#E88C81">' + pend + '</div><div class="sk">a corrigir</div></div>' : '');
 }
-function renderAll(){ renderCrono(); renderChart(); renderEnvios(); renderBanda(); }
+function renderAll(){ renderCrono(); renderChart(); renderEnvios(); renderBanda(); renderRel(); }
 
 $("#btn-import").addEventListener("click", () => importar($("#paste").value));
 $("#btn-limpar").addEventListener("click", () => { $("#paste").value = ""; $("#import-msg").innerHTML = ""; });
@@ -980,6 +1108,10 @@ async function carregarCrono(){
 $("#btn-sheets").addEventListener("click", carregarEnvio);
 $("#btn-crono").addEventListener("click", carregarCrono);
 $("#btn-varrer").addEventListener("click", () => varrer(true));
+$("#seg-periodo").addEventListener("click", ev => {
+  const b = ev.target.closest("button[data-dias]");
+  if(b){ relDias = +b.dataset.dias; renderRel(); }
+});
 $("#btn-zerar").addEventListener("click", () => {
   state.envios = []; state.crono = []; state.sel = null;
   try{ localStorage.removeItem(MISS_KEY); }catch(e){}
@@ -1021,7 +1153,41 @@ function candidatos(){
    ainda em andamento sobrescreve o resultado da que o usuário acabou de pedir. */
 let scanAtual = 0;
 async function varrer(forcar){
-  return varrerAbas(forcar, ++scanAtual);
+  const meu = ++scanAtual;
+  return CONFIG.WEBAPP_URL ? varrerPonte(meu) : varrerAbas(forcar, meu);
+}
+
+/* Caminho padrão: todas as abas de envio da planilha, sem limitador.
+   A data que vale é a do NOME da aba — o cabeçalho não é cruzado. */
+async function varrerPonte(meu){
+  const st = $("#sheets-status"), box = $("#varredura");
+  st.textContent = "lendo a planilha…";
+  box.innerHTML = '<p class="empty">Lendo todas as abas de envio…</p>';
+  let abas;
+  try{ abas = await ponteEnvios(0); }
+  catch(e){
+    if(!vivo(meu)) return;
+    st.textContent = "planilha inacessível";
+    box.innerHTML = '<div class="msg err">Não consegui falar com a ponte de leitura: ' + esc(e.message) +
+      '. Confira <span class="mono">CONFIG.WEBAPP_URL</span> e se a implantação do Apps Script está ' +
+      'como "qualquer pessoa". A entrada manual, no fim da página, continua valendo.</div>';
+    return;
+  }
+  const alvo = document.createElement("div");
+  let achados = 0; const vistos = [];
+  for(const a of abas){
+    if(!vivo(meu)) return;
+    const r = importar(matrizParaCsv(a.valores),
+                       {destino: a.destino, data: a.data, origem: a.titulo, alvo});
+    if(r && r.tipo === "envio"){ achados++; vistos.push(a.titulo); }
+  }
+  if(!vivo(meu)) return;
+  podar(vistos);
+  renderAll();
+  st.textContent = achados + " de " + abas.length + " aba(s) de envio na planilha";
+  box.innerHTML = resumoVarredura(achados, null,
+    abas.length ? null : "A planilha não tem aba com o padrão " +
+      '<span class="mono">dd/mm Destino Envio</span>.');
 }
 const vivo = meu => meu === scanAtual;
 
@@ -1036,6 +1202,7 @@ async function varrerAbas(forcar, meu){
   let achados = 0, erro = null; const vistos = [];
   try{ await calibrar(); }
   catch(e){
+    if(!vivo(meu)) return;              // outra varredura já assumiu a tela
     st.textContent = "planilha inacessível";
     box.innerHTML = '<div class="msg err">Não consegui ler a planilha (' + esc(e.message) +
       '). Verifique se ela está compartilhada como "qualquer pessoa com o link — leitor". ' +
