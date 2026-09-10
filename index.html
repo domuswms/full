@@ -331,33 +331,35 @@ svg .bar.sel{fill:var(--bar-sel)}
    Trocar SHEET_ID só se a planilha mudar.
    ============================================================ */
 const CONFIG = {
-  SHEET_ID: "1oTrpuueox03WivYXC02J_V7AqEOZpRpLvc12snnzV9c",   // "PREPARAÇÃO FULL PR /SC 2"
+  // "PREPARAÇÃO FULL PR /SC 2" — pública (qualquer pessoa com o link, leitor)
+  SHEET_ID: "1oTrpuueox03WivYXC02J_V7AqEOZpRpLvc12snnzV9c",
   ABA_CRONOGRAMA: "CRONOGRAMA",
-  // Ponte de leitura (Apps Script publicado na planilha). Com ela a página lê
-  // TODAS as abas, sem limitador e sem problema de CORS. Sem ela, sobra o
-  // caminho antigo — adivinhar nomes de aba por data — que depende do gviz
-  // liberar CORS e não enxerga aba nenhuma fora da janela de datas.
-  WEBAPP_URL: "https://script.google.com/a/macros/domuscommerce.com/s/AKfycbxRZk9ZNwcp--yFWK4u41PUoPW1SKicVGNIYTSNCKE5YE-p-jlnrN_1ihqMiis-0QQ4Ww/exec",
-  DESTINOS: ["Itajaí", "Londrina"],       // usados só no caminho de reserva
-  JANELA: {antes: 21, depois: 10},        // idem — só vale no modo reserva
-  /* Nome das abas como a operação escreve: "01/09 ITAJAI .ENVIO".
-     O que identifica a aba é a DATA no começo; o resto é rótulo do destino
-     e pode vir com ou sem acento, com ou sem ponto, com ou sem "ENVIO". */
+  DESTINOS: ["ITAJAI", "LONDRINA"],
+
+  /* Nomes de aba como a operação escreve: "01/09 ITAJAI .ENVIO" e
+     "13/12 ITAJAI ENVIO". O que identifica o envio é a DATA no começo. */
+  sufixos: [" .ENVIO", " ENVIO"],
   padraoNome: /^\s*(\d{1,2})\s*\/\s*(\d{1,2})(?:\s*\/\s*(\d{2,4}))?\s*(.*)$/,
-  fimEnvio: /[\s.]*ENVIO[\s.]*$/i
+  fimEnvio: /[\s.]*ENVIO[\s.]*$/i,
+
+  /* Sem API não dá para listar as abas de uma planilha pública: a descoberta é
+     por tentativa de nome, data a data. Estas são as faixas varridas. */
+  JANELA: {antes: 10, depois: 110},
+  JANELA_FUNDA: {antes: 90, depois: 240},
+  PARALELO: 10,
+  TTL_MISS: 30 * 60 * 1000
 };
 
-/* O gviz NÃO devolve erro para aba inexistente: ele entrega a PRIMEIRA aba
-   da planilha. Sem tratar isso, uma varredura por nome serviria os dados
-   errados como se fossem do envio pedido.
 
-   A defesa é comparar a resposta com a de uma aba impossível. Comparar os
-   BYTES não serve: a planilha é editada durante o dia, a primeira aba muda
-   e a comparação passa a falhar (foi o que criou o envio fantasma de 15/09).
-   Então a comparação é por ASSINATURA: primeira célula do cabeçalho + os
-   primeiros códigos ML. Isso identifica a aba e sobrevive a edições de
-   quantidade, situação ou observação. */
+/* Leitura direta da planilha pública. Uma única forma, sem ponte e sem chave.
+
+   Armadilha do gviz: pedir uma aba inexistente NÃO dá erro — devolve a
+   primeira aba da planilha. Como a primeira aba hoje é o CRONOGRAMA, basta
+   perguntar "isto é um envio?" para saber se a aba existe. A assinatura da
+   resposta de calibração fica como segunda linha de defesa, caso alguém mude
+   a ordem das guias. */
 let FALLBACK_ASSIN = null, FALLBACK_EH_ENVIO = false;
+
 function assinatura(texto){
   const rows = parseTable(texto);
   const cab = ((rows[0] || [])[0] || "").trim().slice(0, 40);
@@ -368,28 +370,7 @@ function assinatura(texto){
   }
   return cab + "|" + mls.join(",");
 }
-async function ponteLista(){
-  const u = CONFIG.WEBAPP_URL + (CONFIG.WEBAPP_URL.indexOf("?") === -1 ? "?" : "&") + "acao=lista";
-  const r = await fetch(u, {cache:"no-store", redirect:"follow"});
-  if(!r.ok) throw new Error("HTTP " + r.status);
-  const j = await r.json();
-  if(j.erro) throw new Error(j.erro);
-  return Array.isArray(j) ? j : [];
-}
-async function ponteEnvios(dias){
-  const u = CONFIG.WEBAPP_URL + (CONFIG.WEBAPP_URL.indexOf("?") === -1 ? "?" : "&") +
-            "acao=envios&dias=" + (dias || 0);
-  const r = await fetch(u, {cache:"no-store", redirect:"follow"});
-  if(!r.ok) throw new Error("HTTP " + r.status);
-  const j = await r.json();
-  if(j.erro) throw new Error(j.erro);
-  return j.abas || [];
-}
-/* O web app devolve matriz de células; a página trabalha com texto tabular. */
-function matrizParaCsv(valores){
-  return (valores || []).map(l => l.map(c => '"' + String(c == null ? "" : c).replace(/"/g,'""') + '"')
-                                   .join(",")).join("\n");
-}
+
 function urlAba(nome){
   return "https://docs.google.com/spreadsheets/d/" + CONFIG.SHEET_ID +
          "/gviz/tq?tqx=out:csv&sheet=" + encodeURIComponent(nome);
@@ -672,7 +653,16 @@ async function baixar(base, texto, alvo){
     a.href = URL.createObjectURL(new Blob([bytes], {type:"text/csv;charset=iso-8859-1"}));
     a.download = base + ".csv"; document.body.appendChild(a); a.click();
     setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); }, 1500);
-  }catch(e){ aviso("Download bloqueado neste visualizador."); }
+  }catch(e){
+    /* Rodando dentro do Apps Script a página fica num iframe protegido, onde o
+       download pode ser barrado. Nesse caso entrega o conteúdo para copiar. */
+    if(alvo){
+      alvo.innerHTML = '<div class="msg err">O navegador bloqueou o download aqui. ' +
+        'Copie o conteúdo abaixo e salve como <span class="mono">' + base + '.csv</span> ' +
+        'com codificação ISO-8859-1.</div>' +
+        '<textarea readonly style="margin-top:8px;min-height:150px">' + esc(texto) + '</textarea>';
+    }
+  }
 }
 
 /* ---------- render: cronograma ---------- */
@@ -1086,43 +1076,62 @@ $("#paste").addEventListener("paste", () => setTimeout(() => {
 
 
 /* ---------- leitura direta da planilha ---------- */
-function nomeAbaDe(destino, dataStr){
+function nomesAbaDe(destino, dataStr){
   const d = dObj(dataStr); if(!d) return null;
-  return CONFIG.padraoAba(String(d.getDate()).padStart(2,"0"),
-                          String(d.getMonth()+1).padStart(2,"0"), destino.trim());
+  const dd = String(d.getDate()).padStart(2,"0"), mm = String(d.getMonth()+1).padStart(2,"0");
+  const D = destino.trim().toUpperCase().normalize("NFD").replace(/[\u0300-\u036f]/g,"");
+  return CONFIG.sufixos.map(suf => dd + "/" + mm + " " + D + suf);
 }
 async function carregarEnvio(){
   const msg = $("#sheets-msg"), btn = $("#btn-sheets");
   const destino = ($("#sh-destino").value || "").trim();
   const dataStr = ($("#sh-data").value || "").trim();
   if(!destino || !dataStr){ msg.innerHTML = '<div class="msg err">Informe destino e data do envio.</div>'; return; }
-  const aba = nomeAbaDe(destino, dataStr);
-  if(!aba){ msg.innerHTML = '<div class="msg err">Data inválida. Use dd/mm/aaaa.</div>'; return; }
-  btn.disabled = true; msg.innerHTML = '<div class="msg ok">Lendo a aba "' + esc(aba) + '"…</div>';
-  try{
-    const txt = await baixarAba(aba);
-    $("#destino").value = destino; $("#data").value = dataStr;
-    importar(txt);
-    msg.innerHTML = '<div class="msg ok">Aba "' + esc(aba) + '" carregada da planilha.</div>';
-  }catch(e){
-    msg.innerHTML = '<div class="msg err">Não consegui ler a aba "' + esc(aba) + '": ' + esc(e.message) +
-      '. Confira se o nome da aba segue o padrão <span class="mono">dd/mm Destino Envio</span> e se a planilha está compartilhada como "qualquer pessoa com o link". ' +
-      'Enquanto isso, dá para colar os dados no campo abaixo.</div>';
-  }finally{ btn.disabled = false; }
+  const nomes = nomesAbaDe(destino, dataStr);
+  if(!nomes){ msg.innerHTML = '<div class="msg err">Data inválida. Use dd/mm/aaaa.</div>'; return; }
+  btn.disabled = true;
+  msg.innerHTML = '<div class="msg ok">Procurando a aba de ' + esc(fmt(dataStr)) + '…</div>';
+  let ok = false, ultimo = "";
+  for(const aba of nomes){
+    try{
+      const txt = await baixarAba(aba);
+      const n = lerNomeAba(aba) || {};
+      const r = importar(txt, {destino: n.destino || destino, data: n.data || dataStr,
+                               origem: aba, alvo: document.createElement("div")});
+      if(r && r.tipo === "envio"){
+        renderAll();
+        msg.innerHTML = '<div class="msg ok">Aba "' + esc(aba) + '" carregada.</div>';
+        ok = true; break;
+      }
+    }catch(e){ ultimo = e.message; }
+  }
+  if(!ok) msg.innerHTML = '<div class="msg err">Não achei aba de envio para ' + esc(fmt(dataStr)) +
+    ' com os nomes <span class="mono">' + nomes.map(esc).join(" · ") + '</span>' +
+    (ultimo && ultimo !== "aba inexistente" ? " (" + esc(ultimo) + ")" : "") +
+    '. Se o nome for outro, cole os dados na entrada manual.</div>';
+  btn.disabled = false;
 }
+/* O CRONOGRAMA é a primeira aba, e primeira aba é justamente o que o Google
+   devolve para qualquer nome inexistente. Por isso ele é lido SEM o guarda de
+   assinatura: aqui receber "a primeira aba" é o resultado correto. */
 async function carregarCrono(){
-  const msg = $("#sheets-msg"), btn = $("#btn-crono");
-  btn.disabled = true; msg.innerHTML = '<div class="msg ok">Lendo o cronograma…</div>';
+  const msg = $("#sheets-msg");
   try{
-    const txt = await baixarAba(CONFIG.ABA_CRONOGRAMA);
-    importar(txt);
-    msg.innerHTML = '<div class="msg ok">Cronograma atualizado da planilha.</div>';
+    const txt = await textoAba(CONFIG.ABA_CRONOGRAMA);
+    const r = importar(txt, {origem: CONFIG.ABA_CRONOGRAMA, alvo: document.createElement("div")});
+    if(r && r.tipo === "crono"){ renderCrono(); return true; }
+    return false;                       // aba existe mas está vazia: silêncio
   }catch(e){
-    msg.innerHTML = '<div class="msg err">Não consegui ler a aba ' + CONFIG.ABA_CRONOGRAMA + ': ' + esc(e.message) + '.</div>';
-  }finally{ btn.disabled = false; }
+    msg.innerHTML = '<div class="msg err">Não consegui ler o cronograma: ' + esc(e.message) + '.</div>';
+    return false;
+  }
 }
+
 $("#btn-sheets").addEventListener("click", carregarEnvio);
-$("#btn-crono").addEventListener("click", carregarCrono);
+$("#btn-crono").addEventListener("click", () => carregarCrono().then(ok => {
+  $("#sheets-msg").innerHTML = ok ? '<div class="msg ok">Cronograma atualizado.</div>'
+    : '<div class="msg err">A aba CRONOGRAMA não tem linhas com destino e data.</div>';
+}));
 $("#btn-varrer").addEventListener("click", () => varrer(true));
 $("#seg-periodo").addEventListener("click", ev => {
   const b = ev.target.closest("button[data-dias]");
@@ -1133,14 +1142,6 @@ $("#btn-zerar").addEventListener("click", () => {
   try{ localStorage.removeItem(MISS_KEY); }catch(e){}
   save(); renderAll(); varrer(true);
 });
-
-/* ---------- varredura automática das abas de envio ----------
-   O cronograma da planilha está desatualizado, então a descoberta não pode
-   depender dele: a página tenta os nomes de aba de cada dia da janela
-   (hoje-1 … hoje+6) para cada destino e fica com os que existem de verdade. */
-const MISS_KEY = "domus-full-sem-aba-v1";
-function lerMiss(){ try{ return JSON.parse(localStorage.getItem(MISS_KEY)) || {}; }catch(e){ return {}; } }
-function gravarMiss(m){ try{ localStorage.setItem(MISS_KEY, JSON.stringify(m)); }catch(e){} }
 
 /* O painel mostra o que a planilha tem AGORA. Envio vindo de aba que deixou de
    existir, foi renomeada ou ocultada sai da tela; o que foi colado à mão fica. */
@@ -1154,8 +1155,7 @@ function podar(vistos){
   return antes - state.envios.length;
 }
 
-/* Lê "01/09 ITAJAI .ENVIO" → {data:"01/09/2026", destino:"Itajaí"}.
-   A data é o que identifica o envio; o destino é só rótulo. */
+/* Lê "01/09 ITAJAI .ENVIO" → {data:"01/09/2026", destino:"Itajaí"}. */
 function lerNomeAba(titulo){
   const m = String(titulo).match(CONFIG.padraoNome);
   if(!m) return null;
@@ -1165,7 +1165,6 @@ function lerNomeAba(titulo){
   let dest = (m[4] || "").replace(CONFIG.fimEnvio, "").replace(/[.\s]+$/,"").trim();
   return {data, destino: bonito(dest)};
 }
-/* ITAJAI → Itajaí, LONDRINA → Londrina, o resto em caixa de título. */
 const ACENTOS_DEST = {ITAJAI:"Itajaí", "ITAJAI-SC":"Itajaí", LONDRINA:"Londrina"};
 function bonito(s){
   if(!s) return "Envio";
@@ -1174,154 +1173,98 @@ function bonito(s){
   return k.toLowerCase().replace(/(^|[\s\-])([a-zà-ú])/g, (x,a,b) => a + b.toUpperCase());
 }
 
-/* Nomes tentados no modo reserva, na ordem. */
-function variantes(dd, mm, dest){
-  const d1 = String(Number(dd)), m1 = String(Number(mm)), D = dest.toUpperCase()
-    .normalize("NFD").replace(/[\u0300-\u036f]/g,"");
-  return [
-    dd + "/" + mm + " " + D + " .ENVIO",
-    dd + "/" + mm + " " + D + " ENVIO",
-    dd + "/" + mm + " " + dest + " Envio",
-    dd + "/" + mm + " " + D,
-    d1 + "/" + m1 + " " + D + " .ENVIO"
-  ];
+/* ---------- descoberta das abas ----------
+   Planilha pública, sem API: não existe endpoint que liste as abas. A
+   descoberta é por tentativa de nome, data a data, dentro de uma faixa.
+   Datas passadas que não existem entram em cache — uma aba de ontem não vai
+   nascer. Hoje e futuro são sempre re-testados, porque aba nova aparece. */
+const MISS_KEY = "domus-full-sem-aba-v3";
+function lerMiss(){ try{ return JSON.parse(localStorage.getItem(MISS_KEY)) || {}; }catch(e){ return {}; } }
+function gravarMiss(m){ try{ localStorage.setItem(MISS_KEY, JSON.stringify(m)); }catch(e){} }
+/* Aba de data passada que não existe nunca vai existir: cache permanente.
+   Data de hoje/futuro pode nascer a qualquer momento: cache curto, só para a
+   página não refazer centenas de leituras a cada F5. */
+function ehMiss(miss, nome, passado){
+  const t = miss[nome];
+  if(!t) return false;
+  return passado || (Date.now() - t) < CONFIG.TTL_MISS;
 }
-function candidatos(){
+
+function candidatos(janela){
   const out = [], hoje = hoje0();
-  for(let k = -CONFIG.JANELA.antes; k <= CONFIG.JANELA.depois; k++){
+  for(let k = -janela.antes; k <= janela.depois; k++){
     const d = new Date(hoje.getTime() + k*86400000);
     const dd = String(d.getDate()).padStart(2,"0"), mm = String(d.getMonth()+1).padStart(2,"0");
-    const dataStr = dd + "/" + mm + "/" + d.getFullYear();
-    CONFIG.DESTINOS.forEach(dest =>
-      out.push({destino: dest, data: dataStr, abas: variantes(dd, mm, dest)}));
+    const data = dd + "/" + mm + "/" + d.getFullYear();
+    CONFIG.DESTINOS.forEach(dest => out.push({
+      data, passado: k < 0,
+      abas: CONFIG.sufixos.map(suf => dd + "/" + mm + " " + dest + suf)
+    }));
   }
   return out;
 }
 
-/* Uma varredura mais nova invalida a anterior: sem isso, uma varredura lenta
-   ainda em andamento sobrescreve o resultado da que o usuário acabou de pedir. */
 let scanAtual = 0;
-async function varrer(forcar){
-  const meu = ++scanAtual;
-  return CONFIG.WEBAPP_URL ? varrerPonte(meu) : varrerAbas(forcar, meu);
-}
-
-/* Caminho padrão: todas as abas de envio da planilha, sem limitador.
-   A data que vale é a do NOME da aba — o cabeçalho não é cruzado. */
-async function varrerPonte(meu){
-  const st = $("#sheets-status"), box = $("#varredura");
-  st.textContent = "lendo a planilha…";
-  box.innerHTML = '<p class="empty">Lendo todas as abas de envio…</p>';
-  let abas;
-  try{ abas = await ponteEnvios(0); }
-  catch(e){
-    if(!vivo(meu)) return;
-    st.textContent = "planilha inacessível";
-    /* A implantação está restrita ao domínio da Domus: sem sessão Google da
-       empresa neste navegador, o Google responde com a tela de login e o
-       fetch falha sem detalhe. É de longe a causa mais comum aqui. */
-    box.innerHTML = '<div class="msg err"><b>Não consegui ler a planilha.</b> (' + esc(e.message) + ')<br><br>' +
-      'A ponte é restrita à conta <span class="mono">@domuscommerce.com</span>. ' +
-      '<a href="' + CONFIG.WEBAPP_URL + '" target="_blank" rel="noopener"><b>Abra a ponte nesta aba nova</b></a>, ' +
-      'entre com a conta da empresa e volte aqui em Atualizar. ' +
-      'Se abrir e aparecer o JSON com as abas, é só recarregar esta página.<br><br>' +
-      'A entrada manual, no fim da página, funciona sem login.</div>';
-    return;
-  }
-  let todas = [];
-  try{ todas = await ponteLista(); }catch(e){}          // diagnóstico é opcional
-  const alvo = document.createElement("div");
-  let achados = 0; const vistos = [];
-  for(const a of abas){
-    if(!vivo(meu)) return;
-    const n = lerNomeAba(a.titulo) || {};
-    const r = importar(matrizParaCsv(a.valores),
-                       {destino: n.destino || a.destino, data: n.data || a.data,
-                        origem: a.titulo, alvo});
-    if(r && r.tipo === "envio"){ achados++; vistos.push(a.titulo); }
-  }
-  if(!vivo(meu)) return;
-  podar(vistos);
-  renderAll();
-  st.textContent = achados + " de " + abas.length + " aba(s) de envio na planilha";
-  box.innerHTML = resumoVarredura(achados, null, diagnostico(todas, abas));
-}
 const vivo = meu => meu === scanAtual;
 
-/* Varre a planilha pelos nomes de aba do padrão dd/mm Destino Envio. */
-async function varrerAbas(forcar, meu){
-  if(meu === undefined) meu = ++scanAtual;
+async function varrer(forcar, funda){
+  const meu = ++scanAtual;
   const st = $("#sheets-status"), box = $("#varredura");
+  const janela = funda ? CONFIG.JANELA_FUNDA : CONFIG.JANELA;
   const miss = forcar ? {} : lerMiss();
-  const lista = candidatos();
-  st.textContent = "procurando envios…";
-  box.innerHTML = '<p class="empty">Lendo a planilha…</p>';
-  let achados = 0, erro = null; const vistos = [];
+  const lista = candidatos(janela);
+
+  box.innerHTML = '<p class="empty">Procurando envios na planilha…</p>';
   try{ await calibrar(); }
   catch(e){
-    if(!vivo(meu)) return;              // outra varredura já assumiu a tela
+    if(!vivo(meu)) return;
     st.textContent = "planilha inacessível";
-    box.innerHTML = '<div class="msg err">Não consegui ler a planilha (' + esc(e.message) +
-      '). Este modo só funciona com a planilha compartilhada como "qualquer pessoa com o link"; ' +
-      'a planilha atual é privada. Conecte a <b>ponte de leitura</b> no campo acima — ' +
-      'ela roda com a sua permissão e não exige abrir a planilha. ' +
-      'A entrada manual, no fim da página, também continua valendo.</div>';
+    box.innerHTML = '<div class="msg err"><b>Não consegui ler a planilha.</b> (' + esc(e.message) + ')<br>' +
+      'Ela precisa estar compartilhada como <b>qualquer pessoa com o link — leitor</b>. ' +
+      'A entrada manual, no fim da página, funciona sem isso.</div>';
     return;
   }
-  for(const c of lista){
-    if(!vivo(meu)) return;
-    for(const nome of c.abas){
-      if(miss[nome]) continue;
-      try{
-        const txt = await baixarAba(nome);
-        const r = importar(txt, {destino: c.destino, data: c.data, origem: nome,
-                                 alvo: document.createElement("div")});
-        if(r && r.tipo === "envio"){ achados++; vistos.push(nome); break; }
-      }catch(e){
-        if(e.message === "aba inexistente") miss[nome] = 1;
-        else erro = e.message;
+
+  const vistos = []; let achados = 0, feitos = 0, erro = null;
+  const total = lista.length;
+
+  /* Uma data por vez seria lento demais numa faixa longa; o navegador aguenta
+     um punhado de leituras simultâneas. */
+  const fila = lista.slice();
+  async function trabalhador(){
+    while(fila.length){
+      if(!vivo(meu)) return;
+      const c = fila.shift();
+      for(const nome of c.abas){
+        if(ehMiss(miss, nome, c.passado)) continue;
+        try{
+          const txt = await baixarAba(nome);
+          const n = lerNomeAba(nome) || {};
+          const r = importar(txt, {destino: n.destino, data: n.data || c.data,
+                                   origem: nome, alvo: document.createElement("div")});
+          if(r && r.tipo === "envio"){ achados++; vistos.push(nome); break; }
+        }catch(e){
+          if(e.message === "aba inexistente"){ miss[nome] = Date.now(); }
+          else erro = e.message;
+        }
       }
+      feitos++;
+      if(feitos % 4 === 0 && vivo(meu))
+        st.textContent = "procurando… " + Math.round(feitos/total*100) + "% · " + achados + " encontrado(s)";
     }
   }
-  gravarMiss(miss);
+  await Promise.all(Array.from({length: CONFIG.PARALELO}, trabalhador));
   if(!vivo(meu)) return;
+
+  gravarMiss(miss);
   podar(vistos);
   renderAll();
-  const cds = candidatos();
-  st.textContent = "modo reserva · " + achados + " envio(s) entre " +
-    fmt(cds[0].data) + " e " + fmt(cds[cds.length-1].data);
+  st.textContent = achados + " envio(s) · " + fmt(lista[0].data) + " a " + fmt(lista[total-1].data);
   box.innerHTML = resumoVarredura(achados, erro, FALLBACK_EH_ENVIO
-    ? '<strong>A primeira aba da planilha é uma aba de envio.</strong> O Google devolve ' +
-      'essa aba no lugar de qualquer nome que não exista, então não consigo diferenciar ' +
-      '"aba inexistente" de "aba real" — e ela mesma pode não aparecer aqui. ' +
-      'Mova o <span class="mono">CRONOGRAMA</span> para a primeira posição da planilha ' +
-      '(arrastar a guia) e clique em Atualizar.'
+    ? '<strong>A primeira aba da planilha é uma aba de envio.</strong> Com o ' +
+      '<span class="mono">CRONOGRAMA</span> na primeira posição a leitura fica mais segura — ' +
+      'o Google devolve a primeira aba no lugar de qualquer nome que não exista.'
     : null);
-}
-
-/* Por que uma aba não virou envio? Sem isso, "puxou só um" vira adivinhação. */
-function diagnostico(todas, lidas){
-  if(!todas.length){
-    return lidas.length ? null :
-      "A ponte respondeu, mas nenhuma aba começa com <span class=\"mono\">dd/mm</span>.";
-  }
-  const ignoradas = todas.filter(a => !a.envio);
-  let h = '<p class="empty" style="margin:0 0 10px">' + todas.length + " abas na planilha · " +
-    (todas.length - ignoradas.length) + " reconhecidas como envio";
-  if(lidas.length && lidas.length !== todas.length - ignoradas.length)
-    h += " · " + lidas.length + " com dados";
-  h += "</p>";
-  if(ignoradas.length){
-    h += '<details style="margin:0 0 14px"><summary style="cursor:pointer;font-size:13px;color:var(--ink-2)">' +
-      "Ver as " + ignoradas.length + " abas ignoradas</summary>" +
-      '<p class="empty" style="padding-top:8px">Uma aba só é lida como envio quando o nome ' +
-      'começa com <span class="mono">dd/mm</span> — como <span class="mono">13/12 ITAJAI .ENVIO</span>. ' +
-      'Se alguma destas devia entrar, é o nome que precisa mudar:</p>' +
-      '<p class="mono" style="font-size:12px;color:var(--ink-2);line-height:1.9">' +
-      ignoradas.map(a => esc(a.titulo) + (a.oculta ? " (oculta)" : "")).join(" · ") +
-      "</p></details>";
-  }
-  return h;
 }
 
 function resumoVarredura(achados, erro, nota){
@@ -1386,7 +1329,9 @@ document.addEventListener("click", async ev => {
   document.head.appendChild(l);
 })();
 
-load(); renderAll(); varrer(false);
+load(); renderAll();
+varrer(false);
+carregarCrono().catch(()=>{});          // cronograma em paralelo, é só contexto
 if(window.claude && claude.use) claude.use("downloads").then(d => { downloads = d; }).catch(()=>{});
 </script>
 
