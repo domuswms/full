@@ -338,13 +338,13 @@ svg .bar.sel{fill:var(--bar-sel)}
    Trocar SHEET_ID só se a planilha mudar.
    ============================================================ */
 const CONFIG = {
-  SHEET_ID: "16DLNehsisZT8EgAsphM4l0Q6QsWFHiPAMpIFhEJfUqc",
+  SHEET_ID: "1oTrpuueox03WivYXC02J_V7AqEOZpRpLvc12snnzV9c",   // "PREPARAÇÃO FULL PR /SC 2"
   ABA_CRONOGRAMA: "CRONOGRAMA",
   // Ponte de leitura (Apps Script publicado na planilha). Com ela a página lê
   // TODAS as abas, sem limitador e sem problema de CORS. Sem ela, sobra o
   // caminho antigo — adivinhar nomes de aba por data — que depende do gviz
   // liberar CORS e não enxerga aba nenhuma fora da janela de datas.
-  WEBAPP_URL: "",
+  WEBAPP_URL: "https://script.google.com/macros/s/AKfycbw9Bqhz8AKh9B3sx98zQLf_FdEH_OOzmOU7-Jd3bJkGo9LwSiNymx1G3oWZuQ-6ntlqDA/exec",
   DESTINOS: ["Itajaí", "Londrina"],       // usados só no caminho de reserva
   JANELA: {antes: 21, depois: 10},        // idem — só vale no modo reserva
   /* Nome das abas como a operação escreve: "01/09 ITAJAI .ENVIO".
@@ -1123,6 +1123,9 @@ async function carregarCrono(){
 $("#btn-sheets").addEventListener("click", carregarEnvio);
 $("#btn-crono").addEventListener("click", carregarCrono);
 const URL_KEY = "domus-full-ponte-v1";
+/* A ponte oficial vem fixa no CONFIG — todo mundo que abre o site já lê a
+   planilha. O valor salvo no navegador é só um override local (teste de outra
+   implantação) e nunca some sozinho. */
 try{ CONFIG.WEBAPP_URL = localStorage.getItem(URL_KEY) || CONFIG.WEBAPP_URL; }catch(e){}
 $("#webapp").value = CONFIG.WEBAPP_URL || "";
 $("#btn-webapp").addEventListener("click", () => {
@@ -1271,8 +1274,10 @@ async function varrerAbas(forcar, meu){
     if(!vivo(meu)) return;              // outra varredura já assumiu a tela
     st.textContent = "planilha inacessível";
     box.innerHTML = '<div class="msg err">Não consegui ler a planilha (' + esc(e.message) +
-      '). Verifique se ela está compartilhada como "qualquer pessoa com o link — leitor". ' +
-      'Enquanto isso, use a entrada manual mais abaixo.</div>';
+      '). Este modo só funciona com a planilha compartilhada como "qualquer pessoa com o link"; ' +
+      'a planilha atual é privada. Conecte a <b>ponte de leitura</b> no campo acima — ' +
+      'ela roda com a sua permissão e não exige abrir a planilha. ' +
+      'A entrada manual, no fim da página, também continua valendo.</div>';
     return;
   }
   for(const c of lista){
