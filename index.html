@@ -313,55 +313,33 @@ svg .bar.sel{fill:var(--bar-sel)}
 const CONFIG = {
   SHEET_ID: "16DLNehsisZT8EgAsphM4l0Q6QsWFHiPAMpIFhEJfUqc",
   ABA_CRONOGRAMA: "CRONOGRAMA",
-  // Chave de API do Google (só leitura de planilhas públicas).
-  // Com ela a página lê a LISTA REAL de abas e ignora as ocultas.
-  // Sem ela, cai no modo reserva: adivinha nomes por data e não sabe o que está oculto.
-  API_KEY: "",
-  DESTINOS: ["Itajaí", "Londrina"],       // usados só no modo reserva
-  JANELA: {antes: 1, depois: 6},          // idem — dias varridos em torno de hoje
-  MAX_ABAS: 20,                           // teto de abas de envio lidas por varredura
+  DESTINOS: ["Itajaí", "Londrina"],
+  JANELA: {antes: 1, depois: 6},          // dias varridos em torno de hoje
   // nome das abas de envio: "10/09 Itajaí Envio"
   padraoAba: (dd, mm, destino) => dd + "/" + mm + " " + destino + " Envio",
-  regexAba: /^\s*(\d{1,2})\/(\d{1,2})\s+(.+?)\s+Envio\s*$/i
+  padraoNome: /^\s*(\d{1,2})\/(\d{1,2})\s+(.+?)\s+Envio\s*$/i
 };
 
 /* O gviz NÃO devolve erro para aba inexistente: ele entrega a PRIMEIRA aba
    da planilha. Sem tratar isso, uma varredura por nome serviria os dados
-   errados como se fossem do envio pedido. Solução: pedir uma aba
-   impossível uma vez, guardar a impressão digital do que volta e descartar
-   toda resposta idêntica a ela. */
-let FALLBACK_HASH = null;
-function hash(str){
-  let h = 5381;
-  for(let i=0;i<str.length;i++) h = ((h<<5) + h + str.charCodeAt(i)) | 0;
-  return h + ":" + str.length;
-}
-/* Lista real das abas, com o sinalizador de oculta. Só a API do Sheets
-   entrega isso — o gviz não sabe dizer o que está oculto. */
-async function listarAbas(){
-  if(!CONFIG.API_KEY) return null;
-  const u = "https://sheets.googleapis.com/v4/spreadsheets/" + CONFIG.SHEET_ID +
-            "?fields=sheets.properties(sheetId,title,hidden,index)&key=" + encodeURIComponent(CONFIG.API_KEY);
-  const r = await fetch(u, {cache:"no-store"});
-  if(!r.ok){
-    let det = "HTTP " + r.status;
-    try{ const j = await r.json(); if(j.error && j.error.message) det = j.error.message; }catch(e){}
-    throw new Error(det);
+   errados como se fossem do envio pedido.
+
+   A defesa é comparar a resposta com a de uma aba impossível. Comparar os
+   BYTES não serve: a planilha é editada durante o dia, a primeira aba muda
+   e a comparação passa a falhar (foi o que criou o envio fantasma de 15/09).
+   Então a comparação é por ASSINATURA: primeira célula do cabeçalho + os
+   primeiros códigos ML. Isso identifica a aba e sobrevive a edições de
+   quantidade, situação ou observação. */
+let FALLBACK_ASSIN = null;
+function assinatura(texto){
+  const rows = parseTable(texto);
+  const cab = ((rows[0] || [])[0] || "").trim().slice(0, 40);
+  const mls = [];
+  for(const r of rows){
+    const c = r.find(x => reML.test(x));
+    if(c){ mls.push((c.match(reML) || [])[1]); if(mls.length === 5) break; }
   }
-  const j = await r.json();
-  return (j.sheets || []).map(x => x.properties)
-    .map(p => ({gid: p.sheetId, titulo: p.title, oculta: p.hidden === true, ordem: p.index}));
-}
-function urlGid(gid){
-  return "https://docs.google.com/spreadsheets/d/" + CONFIG.SHEET_ID +
-         "/gviz/tq?tqx=out:csv&gid=" + encodeURIComponent(gid);
-}
-async function baixarGid(gid){                 // por gid é exato: não existe queda para a 1ª aba
-  const r = await fetch(urlGid(gid), {cache:"no-store"});
-  if(!r.ok) throw new Error("HTTP " + r.status);
-  const txt = new TextDecoder("utf-8").decode(await r.arrayBuffer());
-  if(/^\s*</.test(txt)) throw new Error("planilha sem acesso público");
-  return txt;
+  return cab + "|" + mls.join(",");
 }
 function urlAba(nome){
   return "https://docs.google.com/spreadsheets/d/" + CONFIG.SHEET_ID +
@@ -375,13 +353,13 @@ async function textoAba(nome){
   return txt;
 }
 async function calibrar(){
-  if(FALLBACK_HASH !== null) return;
-  FALLBACK_HASH = hash(await textoAba("__ABA_INEXISTENTE_" + Date.now() + "__"));
+  if(FALLBACK_ASSIN !== null) return;
+  FALLBACK_ASSIN = assinatura(await textoAba("__ABA_INEXISTENTE_" + Date.now() + "__"));
 }
 async function baixarAba(nome){
   await calibrar();
   const txt = await textoAba(nome);
-  if(hash(txt) === FALLBACK_HASH) throw new Error("aba inexistente");
+  if(assinatura(txt) === FALLBACK_ASSIN) throw new Error("aba inexistente");
   return txt;
 }
 </script>
@@ -520,9 +498,10 @@ function auditar(env){
     t: "Total divergente: planilha " + env.totalDecl + " × lista " + un +
        " (" + (env.totalDecl > un ? "+" : "") + (env.totalDecl - un) + ")",
     d: "O sistema vai reconhecer o total da planilha. Resolva antes de subir."});
-  if(env.dataNome && env.data && fmt(env.dataNome) !== fmt(env.data)) a.push({k:"w",
-    t: "Aba " + fmt(env.dataNome) + " × cabeçalho " + fmt(env.data),
-    d: "Estou usando a data do cabeçalho da aba. Se a certa for a do nome da aba, corrija o cabeçalho na planilha."});
+  if(env.meta && env.meta.dataDecl && env.data &&
+     fmt(completarAno(env.meta.dataDecl)) !== fmt(env.data)) a.push({k:"w",
+    t: "Nome da aba " + fmt(env.data) + " × cabeçalho " + fmt(completarAno(env.meta.dataDecl)),
+    d: "Estou usando a data do nome da aba. Vale corrigir o cabeçalho na planilha para os dois baterem."});
   const porEan = {};
   env.itens.forEach(i => {
     if(!i.uni || /^N\/?A$/i.test(i.uni)) return;
@@ -875,16 +854,12 @@ function importar(texto, opts){
        reserva, e a diferença entre os dois vira aviso na conferência. */
     const dataAba = p.dataDecl ? completarAno(p.dataDecl) : null;
     const dataNome = (opts.data || $("#data").value || "").trim();
-    /* Modo reserva: como o gviz entrega a primeira aba quando o nome não existe,
-       exigir que o conteúdo confirme a data pedida. Sem essa prova, recusa —
-       antes bastava a impressão digital não bater (e ela muda se alguém editar
-       a planilha entre a calibração e a busca) para um envio fantasma entrar. */
-    if(opts.exigirData){
-      if(!dataAba) return {tipo:"recusado", motivo:"aba sem DATA DO ENVIO no cabeçalho"};
-      if(fmt(dataAba) !== fmt(opts.exigirData))
-        return {tipo:"recusado", motivo:"cabeçalho diz " + fmt(dataAba) + ", não " + fmt(opts.exigirData)};
-    }
-    const data = dataAba || dataNome ||
+    /* Muitas abas têm o cabeçalho de data desatualizado, então ele não pode
+       eliminar a aba — só informar. Quando o cabeçalho e o nome da aba
+       discordam, vale o NOME (que é como a operação chama o envio) e a
+       diferença aparece na conferência. */
+    const usarNome = !!(opts.origem && dataNome && dataAba && fmt(dataAba) !== fmt(dataNome));
+    const data = (usarNome ? dataNome : dataAba) || dataNome ||
       fmt(new Date().getDate() + "/" + (new Date().getMonth()+1) + "/" + new Date().getFullYear());
     const id = slug(destino) + "-" + slug(data) + "-" + Date.now().toString(36);
     state.envios = state.envios.filter(e => !(slug(e.destino) === slug(destino) && fmt(e.data) === fmt(data)));
@@ -1046,65 +1021,12 @@ function candidatos(){
    ainda em andamento sobrescreve o resultado da que o usuário acabou de pedir. */
 let scanAtual = 0;
 async function varrer(forcar){
-  const meu = ++scanAtual;
-  return CONFIG.API_KEY ? varrerPelaLista(meu) : varrerAdivinhando(forcar, meu);
+  return varrerAbas(forcar, ++scanAtual);
 }
 const vivo = meu => meu === scanAtual;
 
-/* Modo padrão: lista real de abas, só as VISÍVEIS. */
-async function varrerPelaLista(meu){
-  const st = $("#sheets-status"), box = $("#varredura");
-  st.textContent = "lendo as abas…";
-  box.innerHTML = '<p class="empty">Lendo a lista de abas da planilha…</p>';
-  let abas;
-  try{ abas = await listarAbas(); }
-  catch(e){
-    st.textContent = "lista de abas indisponível";
-    box.innerHTML = '<div class="msg err">Não consegui listar as abas: ' + esc(e.message) +
-      '. Confira a chave de API em <span class="mono">CONFIG.API_KEY</span> e se a planilha está ' +
-      'compartilhada como "qualquer pessoa com o link — leitor". Caindo para a varredura por data…</div>';
-    return varrerAdivinhando(true, meu);
-  }
-  const visiveis = abas.filter(a => !a.oculta);
-  const ocultas = abas.length - visiveis.length;
-  const envios = visiveis
-    .map(a => ({a, m: a.titulo.match(CONFIG.regexAba)}))
-    .filter(x => x.m)
-    .map(x => ({
-      gid: x.a.gid, titulo: x.a.titulo,
-      destino: x.m[3].trim(),
-      data: completarAno(x.m[1].padStart(2,"0") + "/" + x.m[2].padStart(2,"0"))
-    }))
-    .sort((p,q) => (dObj(q.data)||0) - (dObj(p.data)||0))
-    .slice(0, CONFIG.MAX_ABAS);
-
-  let achados = 0, erro = null; const vistos = [];
-  const alvo = document.createElement("div");
-  for(const e of envios){
-    if(!vivo(meu)) return;
-    try{
-      const txt = await baixarGid(e.gid);
-      const r = importar(txt, {destino: e.destino, data: e.data, origem: e.titulo, alvo});
-      if(r && r.tipo === "envio"){ achados++; vistos.push(e.titulo); }
-    }catch(err){ erro = err.message; }
-  }
-  const crono = visiveis.find(a => a.titulo.trim().toUpperCase() === CONFIG.ABA_CRONOGRAMA);
-  if(crono){
-    try{ importar(await baixarGid(crono.gid), {origem: crono.titulo, alvo}); }catch(err){}
-  }
-  if(!vivo(meu)) return;
-  podar(vistos);
-  renderAll();
-  st.textContent = achados + " de " + envios.length + " aba(s) de envio visíveis" +
-    (ocultas ? " · " + ocultas + " oculta(s) ignorada(s)" : "");
-  box.innerHTML = resumoVarredura(achados, erro,
-    envios.length ? null : "Nenhuma aba visível com o padrão <span class=\"mono\">dd/mm Destino Envio</span>. " +
-      abas.length + " abas na planilha, " + ocultas + " ocultas.");
-}
-
-/* Modo reserva (sem chave de API): adivinha nomes por data.
-   Não enxerga o que está oculto — abas ocultas com nome no padrão entram. */
-async function varrerAdivinhando(forcar, meu){
+/* Varre a planilha pelos nomes de aba do padrão dd/mm Destino Envio. */
+async function varrerAbas(forcar, meu){
   if(meu === undefined) meu = ++scanAtual;
   const st = $("#sheets-status"), box = $("#varredura");
   const miss = forcar ? {} : lerMiss();
@@ -1126,9 +1048,8 @@ async function varrerAdivinhando(forcar, meu){
     try{
       const txt = await baixarAba(c.aba);
       const r = importar(txt, {destino: c.destino, data: c.data, origem: c.aba,
-                               exigirData: c.data, alvo: document.createElement("div")});
+                               alvo: document.createElement("div")});
       if(r && r.tipo === "envio"){ achados++; vistos.push(c.aba); }
-      else if(r && r.tipo === "recusado") miss[c.aba] = 1;
     }catch(e){
       if(e.message === "aba inexistente") miss[c.aba] = 1;
       else erro = e.message;
@@ -1138,11 +1059,9 @@ async function varrerAdivinhando(forcar, meu){
   if(!vivo(meu)) return;
   podar(vistos);
   renderAll();
-  st.textContent = achados + " envio(s) na janela de " +
-    (CONFIG.JANELA.antes + CONFIG.JANELA.depois + 1) + " dias · sem filtro de abas ocultas";
-  box.innerHTML = resumoVarredura(achados, erro,
-    'Modo reserva: sem <span class="mono">CONFIG.API_KEY</span> não dá para saber quais abas estão ' +
-    'ocultas, então a busca é por nome de aba dentro da janela de datas.');
+  st.textContent = achados + " envio(s) entre " + fmt(candidatos()[0].data) + " e " +
+    fmt(candidatos().slice(-1)[0].data);
+  box.innerHTML = resumoVarredura(achados, erro, null);
 }
 
 function resumoVarredura(achados, erro, nota){
@@ -1207,7 +1126,6 @@ document.addEventListener("click", async ev => {
   document.head.appendChild(l);
 })();
 
-if(window.__PRESET_KEY) CONFIG.API_KEY = window.__PRESET_KEY;   // usado só nos testes
 load(); renderAll(); varrer(false);
 if(window.claude && claude.use) claude.use("downloads").then(d => { downloads = d; }).catch(()=>{});
 </script>
