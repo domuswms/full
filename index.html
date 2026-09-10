@@ -244,13 +244,6 @@ svg .bar.sel{fill:var(--bar-sel)}
     </div>
     <div class="body">
       <div id="varredura"></div>
-      <div class="row" style="margin-top:16px;align-items:flex-end">
-        <label class="f" style="flex:1 1 340px">Ponte de leitura (URL /exec do Apps Script) — com ela a página lê <b>todas</b> as abas, sem filtro de data
-          <input id="webapp" placeholder="https://script.google.com/macros/s/.../exec">
-        </label>
-        <div class="shrink"><button class="btn primary" id="btn-webapp">Conectar</button></div>
-      </div>
-
       <details style="margin-top:14px">
         <summary style="cursor:pointer;font-size:13px;color:var(--ink-2)">Carregar uma data específica (modo reserva)</summary>
         <div class="row" style="margin-top:12px">
@@ -344,7 +337,7 @@ const CONFIG = {
   // TODAS as abas, sem limitador e sem problema de CORS. Sem ela, sobra o
   // caminho antigo — adivinhar nomes de aba por data — que depende do gviz
   // liberar CORS e não enxerga aba nenhuma fora da janela de datas.
-  WEBAPP_URL: "https://script.google.com/macros/s/AKfycbw9Bqhz8AKh9B3sx98zQLf_FdEH_OOzmOU7-Jd3bJkGo9LwSiNymx1G3oWZuQ-6ntlqDA/exec",
+  WEBAPP_URL: "https://script.google.com/a/macros/domuscommerce.com/s/AKfycbxRZk9ZNwcp--yFWK4u41PUoPW1SKicVGNIYTSNCKE5YE-p-jlnrN_1ihqMiis-0QQ4Ww/exec",
   DESTINOS: ["Itajaí", "Londrina"],       // usados só no caminho de reserva
   JANELA: {antes: 21, depois: 10},        // idem — só vale no modo reserva
   /* Nome das abas como a operação escreve: "01/09 ITAJAI .ENVIO".
@@ -374,6 +367,14 @@ function assinatura(texto){
     if(c){ mls.push((c.match(reML) || [])[1]); if(mls.length === 5) break; }
   }
   return cab + "|" + mls.join(",");
+}
+async function ponteLista(){
+  const u = CONFIG.WEBAPP_URL + (CONFIG.WEBAPP_URL.indexOf("?") === -1 ? "?" : "&") + "acao=lista";
+  const r = await fetch(u, {cache:"no-store", redirect:"follow"});
+  if(!r.ok) throw new Error("HTTP " + r.status);
+  const j = await r.json();
+  if(j.erro) throw new Error(j.erro);
+  return Array.isArray(j) ? j : [];
 }
 async function ponteEnvios(dias){
   const u = CONFIG.WEBAPP_URL + (CONFIG.WEBAPP_URL.indexOf("?") === -1 ? "?" : "&") +
@@ -1122,25 +1123,6 @@ async function carregarCrono(){
 }
 $("#btn-sheets").addEventListener("click", carregarEnvio);
 $("#btn-crono").addEventListener("click", carregarCrono);
-const URL_KEY = "domus-full-ponte-v1";
-/* A ponte oficial vem fixa no CONFIG — todo mundo que abre o site já lê a
-   planilha. O valor salvo no navegador é só um override local (teste de outra
-   implantação) e nunca some sozinho. */
-try{ CONFIG.WEBAPP_URL = localStorage.getItem(URL_KEY) || CONFIG.WEBAPP_URL; }catch(e){}
-$("#webapp").value = CONFIG.WEBAPP_URL || "";
-$("#btn-webapp").addEventListener("click", () => {
-  const u = $("#webapp").value.trim();
-  if(u && !/^https:\/\/script\.google\.com\/macros\/s\/[^/]+\/exec/.test(u)){
-    $("#sheets-msg").innerHTML = '<div class="msg err">Essa não parece a URL da implantação. ' +
-      'Ela termina em <span class="mono">/exec</span> — pegue em Implantar → Gerenciar implantações.</div>';
-    return;
-  }
-  CONFIG.WEBAPP_URL = u;
-  try{ u ? localStorage.setItem(URL_KEY, u) : localStorage.removeItem(URL_KEY); }catch(e){}
-  $("#sheets-msg").innerHTML = u ? '<div class="msg ok">Ponte conectada. Lendo todas as abas…</div>'
-                                 : '<div class="msg ok">Ponte desligada. Voltando ao modo reserva.</div>';
-  varrer(true);
-});
 $("#btn-varrer").addEventListener("click", () => varrer(true));
 $("#seg-periodo").addEventListener("click", ev => {
   const b = ev.target.closest("button[data-dias]");
@@ -1235,11 +1217,19 @@ async function varrerPonte(meu){
   catch(e){
     if(!vivo(meu)) return;
     st.textContent = "planilha inacessível";
-    box.innerHTML = '<div class="msg err">Não consegui falar com a ponte de leitura: ' + esc(e.message) +
-      '. Confira <span class="mono">CONFIG.WEBAPP_URL</span> e se a implantação do Apps Script está ' +
-      'como "qualquer pessoa". A entrada manual, no fim da página, continua valendo.</div>';
+    /* A implantação está restrita ao domínio da Domus: sem sessão Google da
+       empresa neste navegador, o Google responde com a tela de login e o
+       fetch falha sem detalhe. É de longe a causa mais comum aqui. */
+    box.innerHTML = '<div class="msg err"><b>Não consegui ler a planilha.</b> (' + esc(e.message) + ')<br><br>' +
+      'A ponte é restrita à conta <span class="mono">@domuscommerce.com</span>. ' +
+      '<a href="' + CONFIG.WEBAPP_URL + '" target="_blank" rel="noopener"><b>Abra a ponte nesta aba nova</b></a>, ' +
+      'entre com a conta da empresa e volte aqui em Atualizar. ' +
+      'Se abrir e aparecer o JSON com as abas, é só recarregar esta página.<br><br>' +
+      'A entrada manual, no fim da página, funciona sem login.</div>';
     return;
   }
+  let todas = [];
+  try{ todas = await ponteLista(); }catch(e){}          // diagnóstico é opcional
   const alvo = document.createElement("div");
   let achados = 0; const vistos = [];
   for(const a of abas){
@@ -1254,9 +1244,7 @@ async function varrerPonte(meu){
   podar(vistos);
   renderAll();
   st.textContent = achados + " de " + abas.length + " aba(s) de envio na planilha";
-  box.innerHTML = resumoVarredura(achados, null,
-    abas.length ? null : "A planilha não tem aba com o padrão " +
-      '<span class="mono">dd/mm Destino Envio</span>.');
+  box.innerHTML = resumoVarredura(achados, null, diagnostico(todas, abas));
 }
 const vivo = meu => meu === scanAtual;
 
@@ -1309,6 +1297,31 @@ async function varrerAbas(forcar, meu){
       'Mova o <span class="mono">CRONOGRAMA</span> para a primeira posição da planilha ' +
       '(arrastar a guia) e clique em Atualizar.'
     : null);
+}
+
+/* Por que uma aba não virou envio? Sem isso, "puxou só um" vira adivinhação. */
+function diagnostico(todas, lidas){
+  if(!todas.length){
+    return lidas.length ? null :
+      "A ponte respondeu, mas nenhuma aba começa com <span class=\"mono\">dd/mm</span>.";
+  }
+  const ignoradas = todas.filter(a => !a.envio);
+  let h = '<p class="empty" style="margin:0 0 10px">' + todas.length + " abas na planilha · " +
+    (todas.length - ignoradas.length) + " reconhecidas como envio";
+  if(lidas.length && lidas.length !== todas.length - ignoradas.length)
+    h += " · " + lidas.length + " com dados";
+  h += "</p>";
+  if(ignoradas.length){
+    h += '<details style="margin:0 0 14px"><summary style="cursor:pointer;font-size:13px;color:var(--ink-2)">' +
+      "Ver as " + ignoradas.length + " abas ignoradas</summary>" +
+      '<p class="empty" style="padding-top:8px">Uma aba só é lida como envio quando o nome ' +
+      'começa com <span class="mono">dd/mm</span> — como <span class="mono">13/12 ITAJAI .ENVIO</span>. ' +
+      'Se alguma destas devia entrar, é o nome que precisa mudar:</p>' +
+      '<p class="mono" style="font-size:12px;color:var(--ink-2);line-height:1.9">' +
+      ignoradas.map(a => esc(a.titulo) + (a.oculta ? " (oculta)" : "")).join(" · ") +
+      "</p></details>";
+  }
+  return h;
 }
 
 function resumoVarredura(achados, erro, nota){
