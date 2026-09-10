@@ -230,7 +230,8 @@ svg .bar.sel{fill:var(--bar-sel)}
     <div class="head"><h2>Envios na planilha</h2>
       <div style="display:flex;gap:9px;align-items:center">
         <span class="eyebrow" id="sheets-status">procurando…</span>
-        <button class="btn sm" id="btn-varrer">Atualizar</button>
+          <button class="btn sm" id="btn-varrer">Atualizar</button>
+        <button class="btn sm" id="btn-zerar">Limpar salvos</button>
       </div>
     </div>
     <div class="body">
@@ -387,7 +388,7 @@ async function baixarAba(nome){
 <script>
 "use strict";
 const $ = s => document.querySelector(s);
-const KEY = "domus-full-sep-v1";
+const KEY = "domus-full-sep-v2";   // v2: descarta o estado acumulado das versões anteriores
 let downloads = null;
 let state = { envios: [], crono: [], sel: null };
 
@@ -874,6 +875,15 @@ function importar(texto, opts){
        reserva, e a diferença entre os dois vira aviso na conferência. */
     const dataAba = p.dataDecl ? completarAno(p.dataDecl) : null;
     const dataNome = (opts.data || $("#data").value || "").trim();
+    /* Modo reserva: como o gviz entrega a primeira aba quando o nome não existe,
+       exigir que o conteúdo confirme a data pedida. Sem essa prova, recusa —
+       antes bastava a impressão digital não bater (e ela muda se alguém editar
+       a planilha entre a calibração e a busca) para um envio fantasma entrar. */
+    if(opts.exigirData){
+      if(!dataAba) return {tipo:"recusado", motivo:"aba sem DATA DO ENVIO no cabeçalho"};
+      if(fmt(dataAba) !== fmt(opts.exigirData))
+        return {tipo:"recusado", motivo:"cabeçalho diz " + fmt(dataAba) + ", não " + fmt(opts.exigirData)};
+    }
     const data = dataAba || dataNome ||
       fmt(new Date().getDate() + "/" + (new Date().getMonth()+1) + "/" + new Date().getFullYear());
     const id = slug(destino) + "-" + slug(data) + "-" + Date.now().toString(36);
@@ -995,6 +1005,11 @@ async function carregarCrono(){
 $("#btn-sheets").addEventListener("click", carregarEnvio);
 $("#btn-crono").addEventListener("click", carregarCrono);
 $("#btn-varrer").addEventListener("click", () => varrer(true));
+$("#btn-zerar").addEventListener("click", () => {
+  state.envios = []; state.crono = []; state.sel = null;
+  try{ localStorage.removeItem(MISS_KEY); }catch(e){}
+  save(); renderAll(); varrer(true);
+});
 
 /* ---------- varredura automática das abas de envio ----------
    O cronograma da planilha está desatualizado, então a descoberta não pode
@@ -1003,6 +1018,18 @@ $("#btn-varrer").addEventListener("click", () => varrer(true));
 const MISS_KEY = "domus-full-sem-aba-v1";
 function lerMiss(){ try{ return JSON.parse(localStorage.getItem(MISS_KEY)) || {}; }catch(e){ return {}; } }
 function gravarMiss(m){ try{ localStorage.setItem(MISS_KEY, JSON.stringify(m)); }catch(e){} }
+
+/* O painel mostra o que a planilha tem AGORA. Envio vindo de aba que deixou de
+   existir, foi renomeada ou ocultada sai da tela; o que foi colado à mão fica. */
+function podar(vistos){
+  const antes = state.envios.length;
+  state.envios = state.envios.filter(e => !e.origem || e.origem === "colado" || vistos.indexOf(e.origem) !== -1);
+  if(state.envios.length !== antes){
+    if(!state.envios.some(e => e.id === state.sel)) state.sel = null;
+    save();
+  }
+  return antes - state.envios.length;
+}
 
 function candidatos(){
   const out = [], hoje = hoje0();
@@ -1051,14 +1078,14 @@ async function varrerPelaLista(meu){
     .sort((p,q) => (dObj(q.data)||0) - (dObj(p.data)||0))
     .slice(0, CONFIG.MAX_ABAS);
 
-  let achados = 0, erro = null;
+  let achados = 0, erro = null; const vistos = [];
   const alvo = document.createElement("div");
   for(const e of envios){
     if(!vivo(meu)) return;
     try{
       const txt = await baixarGid(e.gid);
       const r = importar(txt, {destino: e.destino, data: e.data, origem: e.titulo, alvo});
-      if(r && r.tipo === "envio") achados++;
+      if(r && r.tipo === "envio"){ achados++; vistos.push(e.titulo); }
     }catch(err){ erro = err.message; }
   }
   const crono = visiveis.find(a => a.titulo.trim().toUpperCase() === CONFIG.ABA_CRONOGRAMA);
@@ -1066,6 +1093,7 @@ async function varrerPelaLista(meu){
     try{ importar(await baixarGid(crono.gid), {origem: crono.titulo, alvo}); }catch(err){}
   }
   if(!vivo(meu)) return;
+  podar(vistos);
   renderAll();
   st.textContent = achados + " de " + envios.length + " aba(s) de envio visíveis" +
     (ocultas ? " · " + ocultas + " oculta(s) ignorada(s)" : "");
@@ -1083,7 +1111,7 @@ async function varrerAdivinhando(forcar, meu){
   const lista = candidatos();
   st.textContent = "procurando envios…";
   box.innerHTML = '<p class="empty">Lendo a planilha…</p>';
-  let achados = 0, erro = null;
+  let achados = 0, erro = null; const vistos = [];
   try{ await calibrar(); }
   catch(e){
     st.textContent = "planilha inacessível";
@@ -1097,8 +1125,10 @@ async function varrerAdivinhando(forcar, meu){
     if(miss[c.aba]) continue;
     try{
       const txt = await baixarAba(c.aba);
-      const r = importar(txt, {destino: c.destino, data: c.data, origem: c.aba, alvo: document.createElement("div")});
-      if(r && r.tipo === "envio") achados++;
+      const r = importar(txt, {destino: c.destino, data: c.data, origem: c.aba,
+                               exigirData: c.data, alvo: document.createElement("div")});
+      if(r && r.tipo === "envio"){ achados++; vistos.push(c.aba); }
+      else if(r && r.tipo === "recusado") miss[c.aba] = 1;
     }catch(e){
       if(e.message === "aba inexistente") miss[c.aba] = 1;
       else erro = e.message;
@@ -1106,6 +1136,7 @@ async function varrerAdivinhando(forcar, meu){
   }
   gravarMiss(miss);
   if(!vivo(meu)) return;
+  podar(vistos);
   renderAll();
   st.textContent = achados + " envio(s) na janela de " +
     (CONFIG.JANELA.antes + CONFIG.JANELA.depois + 1) + " dias · sem filtro de abas ocultas";
