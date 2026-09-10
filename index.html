@@ -244,8 +244,15 @@ svg .bar.sel{fill:var(--bar-sel)}
     </div>
     <div class="body">
       <div id="varredura"></div>
+      <div class="row" style="margin-top:16px;align-items:flex-end">
+        <label class="f" style="flex:1 1 340px">Ponte de leitura (URL /exec do Apps Script) — com ela a página lê <b>todas</b> as abas, sem filtro de data
+          <input id="webapp" placeholder="https://script.google.com/macros/s/.../exec">
+        </label>
+        <div class="shrink"><button class="btn primary" id="btn-webapp">Conectar</button></div>
+      </div>
+
       <details style="margin-top:14px">
-        <summary style="cursor:pointer;font-size:13px;color:var(--ink-2)">Carregar uma data específica</summary>
+        <summary style="cursor:pointer;font-size:13px;color:var(--ink-2)">Carregar uma data específica (modo reserva)</summary>
         <div class="row" style="margin-top:12px">
           <label class="f">Destino
             <input id="sh-destino" list="destinos" value="Itajaí" placeholder="Itajaí">
@@ -339,10 +346,12 @@ const CONFIG = {
   // liberar CORS e não enxerga aba nenhuma fora da janela de datas.
   WEBAPP_URL: "",
   DESTINOS: ["Itajaí", "Londrina"],       // usados só no caminho de reserva
-  JANELA: {antes: 1, depois: 6},          // idem
-  // nome das abas de envio: "10/09 Itajaí Envio"
-  padraoAba: (dd, mm, destino) => dd + "/" + mm + " " + destino + " Envio",
-  padraoNome: /^\s*(\d{1,2})\/(\d{1,2})\s+(.+?)\s+Envio\s*$/i
+  JANELA: {antes: 21, depois: 10},        // idem — só vale no modo reserva
+  /* Nome das abas como a operação escreve: "01/09 ITAJAI .ENVIO".
+     O que identifica a aba é a DATA no começo; o resto é rótulo do destino
+     e pode vir com ou sem acento, com ou sem ponto, com ou sem "ENVIO". */
+  padraoNome: /^\s*(\d{1,2})\s*\/\s*(\d{1,2})(?:\s*\/\s*(\d{2,4}))?\s*(.*)$/,
+  fimEnvio: /[\s.]*ENVIO[\s.]*$/i
 };
 
 /* O gviz NÃO devolve erro para aba inexistente: ele entrega a PRIMEIRA aba
@@ -355,7 +364,7 @@ const CONFIG = {
    Então a comparação é por ASSINATURA: primeira célula do cabeçalho + os
    primeiros códigos ML. Isso identifica a aba e sobrevive a edições de
    quantidade, situação ou observação. */
-let FALLBACK_ASSIN = null;
+let FALLBACK_ASSIN = null, FALLBACK_EH_ENVIO = false;
 function assinatura(texto){
   const rows = parseTable(texto);
   const cab = ((rows[0] || [])[0] || "").trim().slice(0, 40);
@@ -393,7 +402,13 @@ async function textoAba(nome){
 }
 async function calibrar(){
   if(FALLBACK_ASSIN !== null) return;
-  FALLBACK_ASSIN = assinatura(await textoAba("__ABA_INEXISTENTE_" + Date.now() + "__"));
+  const txt = await textoAba("__ABA_INEXISTENTE_" + Date.now() + "__");
+  FALLBACK_ASSIN = assinatura(txt);
+  /* Se a PRIMEIRA aba da planilha for um envio, ela é servida no lugar de
+     qualquer nome inexistente — e aí não há como distinguir "essa aba não
+     existe" de "essa aba é a primeira". Com o CRONOGRAMA na primeira posição
+     a distinção é trivial. */
+  FALLBACK_EH_ENVIO = ehEnvio(parseTable(txt));
 }
 async function baixarAba(nome){
   await calibrar();
@@ -1107,6 +1122,22 @@ async function carregarCrono(){
 }
 $("#btn-sheets").addEventListener("click", carregarEnvio);
 $("#btn-crono").addEventListener("click", carregarCrono);
+const URL_KEY = "domus-full-ponte-v1";
+try{ CONFIG.WEBAPP_URL = localStorage.getItem(URL_KEY) || CONFIG.WEBAPP_URL; }catch(e){}
+$("#webapp").value = CONFIG.WEBAPP_URL || "";
+$("#btn-webapp").addEventListener("click", () => {
+  const u = $("#webapp").value.trim();
+  if(u && !/^https:\/\/script\.google\.com\/macros\/s\/[^/]+\/exec/.test(u)){
+    $("#sheets-msg").innerHTML = '<div class="msg err">Essa não parece a URL da implantação. ' +
+      'Ela termina em <span class="mono">/exec</span> — pegue em Implantar → Gerenciar implantações.</div>';
+    return;
+  }
+  CONFIG.WEBAPP_URL = u;
+  try{ u ? localStorage.setItem(URL_KEY, u) : localStorage.removeItem(URL_KEY); }catch(e){}
+  $("#sheets-msg").innerHTML = u ? '<div class="msg ok">Ponte conectada. Lendo todas as abas…</div>'
+                                 : '<div class="msg ok">Ponte desligada. Voltando ao modo reserva.</div>';
+  varrer(true);
+});
 $("#btn-varrer").addEventListener("click", () => varrer(true));
 $("#seg-periodo").addEventListener("click", ev => {
   const b = ev.target.closest("button[data-dias]");
@@ -1138,13 +1169,46 @@ function podar(vistos){
   return antes - state.envios.length;
 }
 
+/* Lê "01/09 ITAJAI .ENVIO" → {data:"01/09/2026", destino:"Itajaí"}.
+   A data é o que identifica o envio; o destino é só rótulo. */
+function lerNomeAba(titulo){
+  const m = String(titulo).match(CONFIG.padraoNome);
+  if(!m) return null;
+  const dd = m[1].padStart(2,"0"), mm = m[2].padStart(2,"0");
+  const data = completarAno(dd + "/" + mm + (m[3] ? "/" + m[3] : ""));
+  if(!data) return null;
+  let dest = (m[4] || "").replace(CONFIG.fimEnvio, "").replace(/[.\s]+$/,"").trim();
+  return {data, destino: bonito(dest)};
+}
+/* ITAJAI → Itajaí, LONDRINA → Londrina, o resto em caixa de título. */
+const ACENTOS_DEST = {ITAJAI:"Itajaí", "ITAJAI-SC":"Itajaí", LONDRINA:"Londrina"};
+function bonito(s){
+  if(!s) return "Envio";
+  const k = s.toUpperCase().replace(/\s+/g," ").trim();
+  if(ACENTOS_DEST[k]) return ACENTOS_DEST[k];
+  return k.toLowerCase().replace(/(^|[\s\-])([a-zà-ú])/g, (x,a,b) => a + b.toUpperCase());
+}
+
+/* Nomes tentados no modo reserva, na ordem. */
+function variantes(dd, mm, dest){
+  const d1 = String(Number(dd)), m1 = String(Number(mm)), D = dest.toUpperCase()
+    .normalize("NFD").replace(/[\u0300-\u036f]/g,"");
+  return [
+    dd + "/" + mm + " " + D + " .ENVIO",
+    dd + "/" + mm + " " + D + " ENVIO",
+    dd + "/" + mm + " " + dest + " Envio",
+    dd + "/" + mm + " " + D,
+    d1 + "/" + m1 + " " + D + " .ENVIO"
+  ];
+}
 function candidatos(){
   const out = [], hoje = hoje0();
   for(let k = -CONFIG.JANELA.antes; k <= CONFIG.JANELA.depois; k++){
     const d = new Date(hoje.getTime() + k*86400000);
     const dd = String(d.getDate()).padStart(2,"0"), mm = String(d.getMonth()+1).padStart(2,"0");
     const dataStr = dd + "/" + mm + "/" + d.getFullYear();
-    CONFIG.DESTINOS.forEach(dest => out.push({aba: CONFIG.padraoAba(dd, mm, dest), destino: dest, data: dataStr}));
+    CONFIG.DESTINOS.forEach(dest =>
+      out.push({destino: dest, data: dataStr, abas: variantes(dd, mm, dest)}));
   }
   return out;
 }
@@ -1177,8 +1241,10 @@ async function varrerPonte(meu){
   let achados = 0; const vistos = [];
   for(const a of abas){
     if(!vivo(meu)) return;
+    const n = lerNomeAba(a.titulo) || {};
     const r = importar(matrizParaCsv(a.valores),
-                       {destino: a.destino, data: a.data, origem: a.titulo, alvo});
+                       {destino: n.destino || a.destino, data: n.data || a.data,
+                        origem: a.titulo, alvo});
     if(r && r.tipo === "envio"){ achados++; vistos.push(a.titulo); }
   }
   if(!vivo(meu)) return;
@@ -1211,24 +1277,33 @@ async function varrerAbas(forcar, meu){
   }
   for(const c of lista){
     if(!vivo(meu)) return;
-    if(miss[c.aba]) continue;
-    try{
-      const txt = await baixarAba(c.aba);
-      const r = importar(txt, {destino: c.destino, data: c.data, origem: c.aba,
-                               alvo: document.createElement("div")});
-      if(r && r.tipo === "envio"){ achados++; vistos.push(c.aba); }
-    }catch(e){
-      if(e.message === "aba inexistente") miss[c.aba] = 1;
-      else erro = e.message;
+    for(const nome of c.abas){
+      if(miss[nome]) continue;
+      try{
+        const txt = await baixarAba(nome);
+        const r = importar(txt, {destino: c.destino, data: c.data, origem: nome,
+                                 alvo: document.createElement("div")});
+        if(r && r.tipo === "envio"){ achados++; vistos.push(nome); break; }
+      }catch(e){
+        if(e.message === "aba inexistente") miss[nome] = 1;
+        else erro = e.message;
+      }
     }
   }
   gravarMiss(miss);
   if(!vivo(meu)) return;
   podar(vistos);
   renderAll();
-  st.textContent = achados + " envio(s) entre " + fmt(candidatos()[0].data) + " e " +
-    fmt(candidatos().slice(-1)[0].data);
-  box.innerHTML = resumoVarredura(achados, erro, null);
+  const cds = candidatos();
+  st.textContent = "modo reserva · " + achados + " envio(s) entre " +
+    fmt(cds[0].data) + " e " + fmt(cds[cds.length-1].data);
+  box.innerHTML = resumoVarredura(achados, erro, FALLBACK_EH_ENVIO
+    ? '<strong>A primeira aba da planilha é uma aba de envio.</strong> O Google devolve ' +
+      'essa aba no lugar de qualquer nome que não exista, então não consigo diferenciar ' +
+      '"aba inexistente" de "aba real" — e ela mesma pode não aparecer aqui. ' +
+      'Mova o <span class="mono">CRONOGRAMA</span> para a primeira posição da planilha ' +
+      '(arrastar a guia) e clique em Atualizar.'
+    : null);
 }
 
 function resumoVarredura(achados, erro, nota){
