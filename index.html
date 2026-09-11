@@ -347,6 +347,12 @@ const CONFIG = {
   JANELA: {antes: 10, depois: 110},
   JANELA_FUNDA: {antes: 90, depois: 240},
   PARALELO: 10,
+
+  /* Teto de unidades por arquivo de separação. Existe para que várias pessoas
+     separem o mesmo envio ao mesmo tempo — cada uma com um arquivo. O teto é
+     ultrapassado quando uma única linha já passa dele: dividir o mesmo anúncio
+     em dois arquivos quebraria a regra de uma linha por SKU no sistema. */
+  MAX_UNIDADES_LOTE: 500,
   TTL_MISS: 30 * 60 * 1000
 };
 
@@ -595,14 +601,55 @@ function completarAno(str){          // "10/09" -> "10/09/<ano mais próximo de 
 function hoje0(){ const d = new Date(); d.setHours(0,0,0,0); return d; }
 
 /* ---------- lotes ---------- */
+/* Monta os arquivos de separação com duas restrições e um objetivo:
+     1. o sistema não aceita duas linhas do mesmo SKU no mesmo arquivo;
+     2. teto de CONFIG.MAX_UNIDADES_LOTE unidades por arquivo;
+     3. os arquivos devem ficar EQUILIBRADOS — o ponto de tudo isso é várias
+        pessoas separarem o mesmo envio ao mesmo tempo, e um arquivo de 500
+        ao lado de um de 1 unidade não divide trabalho nenhum.
+
+   Uma linha maior que o teto vira um arquivo sozinha: ela não pode ser
+   dividida (quebraria a regra 1 no sistema) e misturá-la com outras só
+   aumentaria o desequilíbrio.
+
+   O número de arquivos nunca é menor que a maior repetição de um mesmo SKU —
+   se um SKU aparece em 3 anúncios, são no mínimo 3 arquivos. Partindo desse
+   piso e distribuindo do maior para o menor, sempre no arquivo mais vazio que
+   aceita o item, o resultado fica parelho. */
 function lotes(itens){
-  const vistos = {}, grupos = [];
-  for(const it of itens){
-    const i = vistos[it.sku] || 0; vistos[it.sku] = i+1;
-    (grupos[i] = grupos[i] || []).push(it);
-  }
-  return grupos;
+  const cap = CONFIG.MAX_UNIDADES_LOTE || Infinity;
+  const comIndice = itens.map((it, i) => ({it, i}));
+
+  const grandes = comIndice.filter(x => x.it.qtd > cap);
+  const normais = comIndice.filter(x => x.it.qtd <= cap);
+
+  const rep = {};
+  normais.forEach(x => rep[x.it.sku] = (rep[x.it.sku] || 0) + 1);
+  const maiorRep = Math.max(0, ...Object.values(rep));
+  const totalUn = normais.reduce((s,x) => s + x.it.qtd, 0);
+  const piso = Math.max(maiorRep, Math.ceil(totalUn / cap) || 0);
+
+  const caixas = Array.from({length: piso}, () => ({itens: [], un: 0, skus: new Set()}));
+
+  // do maior para o menor: os itens grandes escolhem primeiro, os pequenos
+  // preenchem as folgas — é o que mantém as caixas parelhas.
+  [...normais].sort((a,b) => b.it.qtd - a.it.qtd || a.i - b.i).forEach(x => {
+    let alvo = null;
+    for(const c of caixas){
+      if(c.skus.has(x.it.sku) || c.un + x.it.qtd > cap) continue;
+      if(!alvo || c.un < alvo.un) alvo = c;          // sempre a mais vazia
+    }
+    if(!alvo){ alvo = {itens: [], un: 0, skus: new Set()}; caixas.push(alvo); }
+    alvo.itens.push(x); alvo.un += x.it.qtd; alvo.skus.add(x.it.sku);
+  });
+
+  const saida = caixas.filter(c => c.itens.length)
+    .map(c => c.itens.sort((a,b) => a.i - b.i).map(x => x.it));   // ordem da planilha
+  grandes.forEach(x => saida.push([x.it]));
+  return saida.sort((a,b) => unLote(b) - unLote(a));
 }
+function unLote(g){ return g.reduce((s,i) => s + i.qtd, 0); }
+
 function csvLote(g){
   let s = "codigoProduto;quantidade;IDFULL\n";
   for(const it of g) s += it.sku + ";" + it.qtd + ";" + it.ml + "\n";
@@ -828,12 +875,17 @@ function detalhe(env){
 
   h += '<h3 style="margin:22px 0 10px;font-size:15px">Lotes para o sistema</h3>' +
     '<p class="empty" style="padding:0 0 12px">' + (gs.length === 1
-      ? 'Nenhum SKU repetido: um único arquivo atende o envio.'
-      : 'Cada arquivo tem no máximo uma linha por SKU. Envie um lote por vez.') + '</p>' +
+      ? 'Um único arquivo atende o envio: nenhum SKU repetido e o total cabe no teto de ' +
+        CONFIG.MAX_UNIDADES_LOTE + ' unidades.'
+      : gs.length + ' arquivos — no máximo uma linha por SKU e até ' + CONFIG.MAX_UNIDADES_LOTE +
+        ' unidades cada, para separar em paralelo. Envie um por vez ao sistema.') + '</p>' +
     '<div class="lotes">' + gs.map((g,i) => {
-      const u = g.reduce((s,x)=>s+x.qtd,0);
+      const u = unLote(g), cap = CONFIG.MAX_UNIDADES_LOTE;
+      const estouro = cap && u > cap;
       return '<div class="lote"><div class="n">Lote ' + (i+1) + '</div>' +
         '<div class="m">' + g.length + ' linha' + (g.length>1?'s':'') + ' · ' + u.toLocaleString("pt-BR") + ' un</div>' +
+        (estouro ? '<span class="pill w">acima de ' + cap + ' un — anúncio único de ' +
+            Math.max(...g.map(x=>x.qtd)).toLocaleString("pt-BR") + '</span>' : '') +
         '<div class="fn">' + nomeArq(env, i, gs.length) + '.csv</div>' +
         '<button class="btn sm dl" data-lote="' + i + '">Baixar ISO-8859-1</button></div>';
     }).join("") + '</div>' +
