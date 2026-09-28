@@ -355,7 +355,7 @@ const CANAIS = {
   full: {
     nome: "Full · Mercado Livre",
     eyebrow: "Operação WMS · Full Mercado Livre",
-    sub: "Lê as abas de envio da planilha do full, divide em lotes quando um SKU tem mais de um código ML e deixa os arquivos ISO-8859-1 prontos para o WMS.",
+    sub: "Lê as abas de envio da planilha do full, divide em arquivos de até {TETO} unidades — nunca dois anúncios do mesmo SKU no mesmo arquivo — e exporta em ISO-8859-1 para o WMS.",
     cor: "#ECFC30",
     SHEET_ID: "1oTrpuueox03WivYXC02J_V7AqEOZpRpLvc12snnzV9c",
     ABA_CRONOGRAMA: "CRONOGRAMA",
@@ -369,7 +369,7 @@ const CANAIS = {
   shopee: {
     nome: "Shopee",
     eyebrow: "Operação WMS · Shopee",
-    sub: "Lê as abas de envio da planilha da Shopee e divide a separação em arquivos de até 500 unidades, para várias pessoas separarem ao mesmo tempo.",
+    sub: "Lê as abas de envio da planilha da Shopee e divide a separação em arquivos de até {TETO} unidades, para várias pessoas separarem ao mesmo tempo.",
     cor: "#EE4D2D",
     SHEET_ID: "12da36oF7Ylbz7sbFo5-jJjKlx_MH8MCj0c-Ahn12rJk",   // planilha modelo da Shopee
     ABA_CRONOGRAMA: "CRONOGRAMA",
@@ -383,12 +383,18 @@ const CANAIS = {
 };
 /* comuns aos dois canais */
 const COMUM = {
-  MAX_UNIDADES_LOTE: 500,
+  MAX_UNIDADES_LOTE: 1000,
+  /* Um arquivo só nasce se tiver pelo menos isto. Sobrou pouco e não coube em
+     lugar nenhum? Estoura o teto em vez de mandar alguém separar 40 unidades
+     num arquivo só. */
+  MIN_UNIDADES_LOTE: 250,
   JANELA: {antes: 10, depois: 110},
   JANELA_FUNDA: {antes: 90, depois: 240},
   PARALELO: 10,
   TTL_MISS: 30 * 60 * 1000,
   padraoNome: /^\s*(\d{1,2})\s*\/\s*(\d{1,2})(?:\s*\/\s*(\d{2,4}))?\s*(.*)$/,
+  /* abas de apoio: nunca são envio, nunca entram na conferência */
+  abasIgnoradas: /^\s*(INSTRU[ÇC][ÕO]ES|CRONOGRAMA|MODELO|P[ÁA]GINA\s*\d*|SHEET\s*\d*|PLAN\s*\d*)\s*$/i,
   fimEnvio: /[\s.]*ENVIO[\s.]*$/i
 };
 let canal = "full";
@@ -435,16 +441,21 @@ function sniff(t){
   return Object.keys(c).sort((a,b) => c[b]-c[a])[0] || ",";
 }
 function parseTable(text){
-  const d = sniff(text), rows = []; let row = [], cell = "", q = false;
+  /* Cada linha carrega o próprio número (propriedade .l) para que qualquer
+     problema possa ser apontado como "aba X · linha N" — sem isso, o operador
+     recebe um erro sem saber onde consertar. O número é o da planilha, contando
+     inclusive as linhas vazias que o filtro descarta. */
+  const d = sniff(text), rows = []; let row = [], cell = "", q = false, n = 1;
+  const fecha = () => { row.push(cell); row.l = n++; rows.push(row); row = []; cell = ""; };
   for(let i=0;i<text.length;i++){
     const ch = text[i];
     if(q){ if(ch === '"'){ if(text[i+1] === '"'){ cell += '"'; i++; } else q = false; } else cell += ch; }
     else if(ch === '"') q = true;
     else if(ch === d){ row.push(cell); cell = ""; }
-    else if(ch === "\n"){ row.push(cell); rows.push(row); row = []; cell = ""; }
+    else if(ch === "\n") fecha();
     else if(ch !== "\r") cell += ch;
   }
-  row.push(cell); rows.push(row);
+  fecha();
   return rows.filter(r => r.some(c => c.trim() !== ""));
 }
 
@@ -674,8 +685,9 @@ function parseBloco(rows){
     if(/RETIRAR|CANCELAD|N[ÃA]O ENVIAR/i.test(resto)) flags.push({t:"observação", k:"w"});
     if(/^N\/?A$/i.test(uni) || !uni) flags.push({t:"sem cód. universal", k:"w"});
     if(torto) flags.push({t:"rótulo SKU torto", k:"w"});
-    if(sku && qtd != null) itens.push({sku, qtd, ml, uni, desc, flags});
-    else naoLidas.push({ml, qtd, linha: linhas[0]});
+    if(sku && qtd != null) itens.push({sku, qtd, ml, uni, desc, flags, l: r.l});
+    else naoLidas.push({ml, qtd, l: r.l, motivo: !sku ? "SKU não reconhecido" : "quantidade ausente ou inválida",
+                        texto: linhas[0].slice(0, 90)});
   }
   return {itens, naoLidas, totalDecl, meta:{envioNum: mn ? mn[1] : null, dataDecl: md ? md[1] : null}};
 }
@@ -718,7 +730,9 @@ function parseTabela(rows){
     if(!sku && !bruto) continue;
     const qtd = numero(bruto);
     if(!sku || qtd == null){
-      naoLidas.push({ml:"", qtd, linha: r.slice(0,4).join(" | ")});
+      naoLidas.push({ml:"", qtd, l: r.l,
+                     motivo: !sku ? "SKU vazio" : "quantidade \"" + bruto + "\" não é um número",
+                     texto: r.slice(0,4).filter(x=>String(x).trim()).join(" | ").slice(0, 90)});
       continue;
     }
     const sit = cSit !== -1 ? String(r[cSit] || "") : "";
@@ -734,7 +748,7 @@ function parseTabela(rows){
     if(ehCx && unCx > 1) flags.push({t: (cxSep != null ? cxSep + " cx" : "cx máster") + " · " + unCx + " un/cx", k:"a"});
     let desc = cDes !== -1 ? String(r[cDes] || "").trim() : "";
     if(!desc && cMed !== -1 && String(r[cMed] || "").trim()) desc = "caixa " + String(r[cMed]).trim();
-    itens.push({sku, qtd, ml:"", uni:"", desc, flags, cx: ehCx ? {unCx, cxSep} : null});
+    itens.push({sku, qtd, ml:"", uni:"", desc, flags, cx: ehCx ? {unCx, cxSep} : null, l: r.l});
   }
   return {itens, naoLidas, totalDecl, meta:{envioNum: mn ? mn[1] : null, dataDecl: md ? md[1] : null}};
 }
@@ -759,9 +773,11 @@ function parseCrono(rows){
 function unLote(g){ return g.reduce((s,i) => s + i.qtd, 0); }
 function lotes(itens, cfg){
   cfg = cfg || C();
-  const cap = cfg.MAX_UNIDADES_LOTE || Infinity, regraSKU = cfg.regraSKU;
+  const cap = cfg.MAX_UNIDADES_LOTE || Infinity;
+  const min = cfg.MIN_UNIDADES_LOTE || 0;
+  const regraSKU = cfg.regraSKU;
   const idx = itens.map((it,i) => ({it, i}));
-  const grandes = idx.filter(x => x.it.qtd > cap);
+  const grandes = idx.filter(x => x.it.qtd > cap);      // linha maior que o teto: arquivo só dela
   const normais = idx.filter(x => x.it.qtd <= cap);
 
   let piso = Math.ceil(normais.reduce((s,x)=>s+x.it.qtd,0) / cap) || 0;
@@ -771,25 +787,39 @@ function lotes(itens, cfg){
     piso = Math.max(piso, ...Object.values(rep), 0);
   }
   const caixas = Array.from({length: Math.max(piso, normais.length ? 1 : 0)},
-                            () => ({itens: [], un: 0, skus: new Set()}));
+                            () => ({itens: [], un: 0, skus: new Set(), estouro: 0}));
 
   [...normais].sort((a,b) => b.it.qtd - a.it.qtd || a.i - b.i).forEach(x => {
+    const cabe = c => !(regraSKU && c.skus.has(x.it.sku));
     let alvo = null;
     for(const c of caixas){
-      if(regraSKU && c.skus.has(x.it.sku)) continue;
-      if(c.un + x.it.qtd > cap) continue;
-      if(!alvo || c.un < alvo.un) alvo = c;          // sempre a caixa mais vazia
+      if(!cabe(c) || c.un + x.it.qtd > cap) continue;
+      if(!alvo || c.un < alvo.un) alvo = c;               // sempre a caixa mais vazia
     }
-    if(!alvo){ alvo = {itens: [], un: 0, skus: new Set()}; caixas.push(alvo); }
+    if(!alvo){
+      /* Não coube em nenhuma. Abrir arquivo novo só compensa se ele nascer com
+         volume de trabalho; senão é melhor passar do teto numa caixa existente
+         do que mandar alguém separar um punhado de unidades sozinho. */
+      const compat = caixas.filter(cabe).sort((a,b) => a.un - b.un);
+      if(x.it.qtd < min && compat.length){
+        alvo = compat[0];
+        alvo.estouro += x.it.qtd;
+      }else{
+        alvo = {itens: [], un: 0, skus: new Set(), estouro: 0};
+        caixas.push(alvo);
+      }
+    }
     alvo.itens.push(x); alvo.un += x.it.qtd; alvo.skus.add(x.it.sku);
   });
 
-  const saida = caixas.filter(c => c.itens.length)
-    .map(c => c.itens.sort((a,b) => a.i - b.i).map(x => x.it));
-  grandes.forEach(x => saida.push([x.it]));
+  const saida = caixas.filter(c => c.itens.length).map(c => {
+    const g = c.itens.sort((a,b) => a.i - b.i).map(x => x.it);
+    g.estouro = c.estouro;                                 // por que passou do teto
+    return g;
+  });
+  grandes.forEach(x => { const g = [x.it]; g.estouro = 0; saida.push(g); });
   return saida.sort((a,b) => unLote(b) - unLote(a));
 }
-
 function csvLote(g, cfg){
   const cols = (cfg || C()).colunas;
   let s = cols.join(";") + "\n";
@@ -837,36 +867,77 @@ function baixar(base, texto, alvo, ext){
   }
 }
 
-/* ---------- conferência ---------- */
+/* ---------- conferência ----------
+   Todo problema precisa dizer ONDE está: aba e linha da planilha. Sem isso o
+   operador recebe "total divergente" e não tem por onde começar. */
+function refLinhas(ls){
+  const u = [...new Set(ls.filter(x => x != null))].sort((a,b) => a-b);
+  if(!u.length) return "";
+  if(u.length === 1) return "linha " + u[0];
+  if(u.length <= 8) return "linhas " + u.join(", ");
+  return "linhas " + u.slice(0,8).join(", ") + " e mais " + (u.length-8);
+}
 function auditar(env, cfg){
   cfg = cfg || C();
   const un = env.itens.reduce((s,i)=>s+i.qtd,0), a = [];
-  (env.naoLidas || []).forEach(n => a.push({k:"c",
-    t: "Linha não lida — " + (n.qtd != null ? n.qtd + " un" : "sem quantidade") + " fora da separação",
-    d: n.linha}));
-  if(env.totalDecl != null && env.totalDecl !== un) a.push({k:"c",
-    t: "Total divergente: planilha " + env.totalDecl + " × lista " + un +
-       " (" + (env.totalDecl > un ? "+" : "") + (env.totalDecl - un) + ")",
-    d: "O sistema vai reconhecer o total da planilha. Resolva antes de subir."});
+  const aba = env.origem && env.origem !== "colado" ? env.origem : "entrada manual";
+
+  (env.naoLidas || []).forEach(n => a.push({k:"c", aba,
+    linha: n.l,
+    t: "Linha não lida — " + (n.motivo || "formato não reconhecido"),
+    d: (n.qtd != null ? n.qtd + " unidades ficaram de fora. " : "") + (n.texto || "")}));
+
+  if(env.totalDecl != null && env.totalDecl !== un){
+    const dif = env.totalDecl - un;
+    a.push({k:"c", aba,
+      t: "Total divergente: TOTAL DE PRODUTOS diz " + env.totalDecl.toLocaleString("pt-BR") +
+         ", as linhas somam " + un.toLocaleString("pt-BR") + " (" + (dif > 0 ? "+" : "") + dif + ")",
+      d: (env.naoLidas || []).length
+         ? "Provável causa: as linhas não lidas acima."
+         : "Confira se alguma linha ficou fora do intervalo da fórmula de total, ou se há linha com quantidade em branco."});
+  }
+
+  /* código universal repetido entre SKUs diferentes (só existe no full) */
   const porEan = {};
   env.itens.forEach(i => {
     if(!i.uni || /^N\/?A$/i.test(i.uni)) return;
-    (porEan[i.uni] = porEan[i.uni] || {skus:new Set(), un:0});
-    porEan[i.uni].skus.add(i.sku); porEan[i.uni].un += i.qtd;
+    (porEan[i.uni] = porEan[i.uni] || {skus:new Set(), un:0, ls:[]});
+    porEan[i.uni].skus.add(i.sku); porEan[i.uni].un += i.qtd; porEan[i.uni].ls.push(i.l);
   });
   Object.keys(porEan).forEach(e => {
-    if(porEan[e].skus.size > 1) a.push({k:"w",
-      t: "Código universal " + e + " em " + porEan[e].skus.size + " SKUs (" + porEan[e].un + " un)",
-      d: [...porEan[e].skus].join(" · ") + " — se a extração agrupar por código universal, as unidades saem somadas."});
+    if(porEan[e].skus.size > 1) a.push({k:"w", aba, ref: refLinhas(porEan[e].ls),
+      t: "Código universal " + e + " em " + porEan[e].skus.size + " SKUs diferentes (" + porEan[e].un + " un)",
+      d: [...porEan[e].skus].join(" · ") + " — se a extração agrupar por código universal, as unidades saem somadas num produto só."});
   });
-  if(!cfg.regraSKU){
-    const rep = {};
-    env.itens.forEach(i => rep[i.sku] = (rep[i.sku] || 0) + 1);
-    const dups = Object.keys(rep).filter(k => rep[k] > 1);
-    if(dups.length) a.push({k:"w",
-      t: dups.length + " SKU(s) repetido(s) na aba",
-      d: dups.slice(0,8).join(" · ") + " — sem código de anúncio, linhas repetidas do mesmo SKU provavelmente deveriam estar somadas."});
-  }
+
+  /* SKU repetido */
+  const rep = {};
+  env.itens.forEach(i => { (rep[i.sku] = rep[i.sku] || []).push(i); });
+  Object.keys(rep).filter(k => rep[k].length > 1).forEach(k => {
+    const grupo = rep[k], ls = grupo.map(i => i.l);
+    if(cfg.regraSKU){
+      a.push({k:"n", aba, ref: refLinhas(ls),
+        t: "SKU " + k + " em " + grupo.length + " anúncios — vai para " + grupo.length + " arquivos",
+        d: grupo.map(i => (i.ml || "?") + ": " + i.qtd + " un").join(" · ")});
+    } else {
+      a.push({k:"w", aba, ref: refLinhas(ls),
+        t: "SKU " + k + " repetido em " + grupo.length + " linhas (" + grupo.reduce((s,i)=>s+i.qtd,0) + " un)",
+        d: "Sem código de anúncio, linhas repetidas do mesmo SKU provavelmente deveriam estar somadas numa linha só."});
+    }
+  });
+
+  /* quantidade zerada */
+  const zeros = env.itens.filter(i => i.qtd === 0);
+  if(zeros.length) a.push({k:"w", aba, ref: refLinhas(zeros.map(i=>i.l)),
+    t: zeros.length + " linha(s) com quantidade zero",
+    d: zeros.slice(0,6).map(i => i.sku).join(" · ") + " — não entram em arquivo nenhum."});
+
+  /* SKU com espaço no meio costuma ser erro de digitação */
+  const espaco = env.itens.filter(i => /\s/.test(i.sku));
+  if(espaco.length) a.push({k:"w", aba, ref: refLinhas(espaco.map(i=>i.l)),
+    t: espaco.length + " SKU(s) com espaço no meio",
+    d: espaco.slice(0,6).map(i => '"' + i.sku + '"').join(" · ") + " — confira se o código está completo."});
+
   return a;
 }
 
@@ -881,6 +952,15 @@ function importar(texto, opts){
   const t = (texto || "").trim();
   if(!t){ m.innerHTML = '<div class="msg err">Cole os dados da aba antes de processar.</div>'; return; }
   const rows = parseTable(t);
+  if(opts.origem && COMUM.abasIgnoradas.test(opts.origem)){
+    /* INSTRUÇÕES, MODELO, Página1… são abas de apoio: nunca são envio nem
+       entram na conferência. O CRONOGRAMA é lido pelo caminho próprio. */
+    if(ehCrono(rows)){
+      const c = parseCrono(rows);
+      if(c.length){ est.crono = c; salvarEstado(opts.canal || canal, est); return {tipo:"crono", datas:c.length}; }
+    }
+    return {tipo:"ignorada"};
+  }
   if(ehEnvio(rows, cfg)){
     const p = parseEnvio(rows, cfg);
     if(!p.itens.length){ m.innerHTML = '<div class="msg err">Não encontrei linhas de produto nesta aba.</div>'; return; }
@@ -1073,7 +1153,8 @@ function resumo(achados, erro, nota){
     .sort((a,b) => (dObj(a.data)||0) - (dObj(b.data)||0))
     .map((e,idx) => {
       const gs = lotes(e.itens), un = e.itens.reduce((s,i)=>s+i.qtd,0);
-      const alertas = auditar(e).filter(a => a.k === "c").length;
+      const pontos = auditar(e), alertas = pontos.filter(a => a.k === "c").length;
+      const avisos = pontos.filter(a => a.k === "w").length;
       const d = dObj(e.data), t = hoje0();
       const dias = d ? Math.round((d - t)/86400000) : null;
       const quando = dias === 0 ? "hoje" : dias === 1 ? "amanhã" : dias === -1 ? "ontem"
@@ -1091,7 +1172,8 @@ function resumo(achados, erro, nota){
           '<div><b>' + gs.length + '</b><span>' + (gs.length>1?"arquivos":"arquivo") + '</span></div>' +
         '</div>' +
         (alertas ? '<span class="pill c">' + alertas + ' ponto' + (alertas>1?'s':'') + ' a corrigir</span>'
-                 : '<span class="pill g">total confere com a planilha</span>') +
+         : avisos ? '<span class="pill w">' + avisos + ' ponto' + (avisos>1?'s':'') + ' a verificar</span>'
+         : '<span class="pill g">total confere com a planilha</span>') +
         '<div class="acoes">' +
           '<button class="btn primary sm baixar" data-env="' + e.id + '">Baixar ' +
             (gs.length>1 ? gs.length + ' arquivos' : 'arquivo') + '</button>' +
@@ -1132,29 +1214,45 @@ function detalhe(env){
   const aud = auditar(env);
   if(aud.length){
     const graves = aud.filter(a => a.k === "c").length;
+    const rotulo = {c:"corrigir", w:"verificar", n:"informação"};
     h += '<div style="margin-top:16px;border:1px solid var(--line);border-radius:var(--radius);overflow:hidden">' +
       '<div style="padding:11px 14px;border-bottom:1px solid var(--line);background:' +
-      (graves ? 'var(--crit-soft)' : 'var(--warn-soft)') + '"><strong style="font-size:13.5px;color:' +
-      (graves ? 'var(--crit)' : 'var(--warn)') + '">Conferência — ' + aud.length + ' ponto' +
-      (aud.length>1?'s':'') + (graves ? ' · ' + graves + ' bloqueante' + (graves>1?'s':'') : '') + '</strong></div>' +
-      aud.map(a => '<div style="padding:10px 14px;border-bottom:1px solid var(--line)">' +
-        '<span class="pill ' + a.k + '">' + (a.k === "c" ? "corrigir" : "verificar") + '</span> ' +
-        '<strong style="font-size:13px">' + esc(a.t) + '</strong>' +
-        '<div class="mono" style="font-size:12.5px;color:var(--ink-2);margin-top:3px">' + esc(a.d) + '</div></div>').join("") +
-      '</div>';
+      (graves ? 'var(--crit-soft)' : 'var(--warn-soft)') + '">' +
+      '<strong style="font-size:13.5px;color:' + (graves ? 'var(--crit)' : 'var(--warn)') + '">Conferência — ' +
+      aud.length + ' ponto' + (aud.length>1?'s':'') +
+      (graves ? ' · ' + graves + ' bloqueante' + (graves>1?'s':'') : '') + '</strong>' +
+      '<div class="mono" style="font-size:11.5px;color:var(--ink-2);margin-top:3px">aba ' +
+      esc(env.origem && env.origem !== "colado" ? env.origem : "entrada manual") + '</div></div>' +
+      aud.map(a => {
+        const onde = a.linha != null ? "linha " + a.linha : (a.ref || "planilha inteira");
+        return '<div style="padding:10px 14px;border-bottom:1px solid var(--line);display:flex;gap:10px;align-items:flex-start">' +
+          '<span class="pill ' + a.k + '" style="flex:0 0 auto;margin-top:2px">' + rotulo[a.k] + '</span>' +
+          '<div style="min-width:0">' +
+            '<strong style="font-size:13px">' + esc(a.t) + '</strong>' +
+            (onde ? ' <span class="mono" style="font-size:11.5px;color:var(--ink-3)">· ' +
+                    esc(a.aba) + ' · ' + esc(onde) + '</span>' : '') +
+            '<div class="mono" style="font-size:12.5px;color:var(--ink-2);margin-top:3px;overflow-wrap:anywhere">' +
+            esc(a.d) + '</div></div></div>';
+      }).join("") + '</div>';
   }
 
   h += '<h3 style="margin:22px 0 10px;font-size:15px">Arquivos de separação</h3>' +
     '<p class="empty" style="padding:0 0 12px">' + (gs.length === 1
-      ? 'Um arquivo atende o envio — o total cabe no teto de ' + cap + ' unidades.'
-      : gs.length + ' arquivos de até ' + cap + ' unidades, equilibrados para separação simultânea' +
-        (C().regraSKU ? ', com no máximo uma linha por SKU' : '') + '.') + '</p>' +
+      ? 'Um arquivo atende o envio — o total cabe no teto de ' + cap.toLocaleString("pt-BR") + ' unidades.'
+      : gs.length + ' arquivos de até ' + cap.toLocaleString("pt-BR") +
+        ' unidades, equilibrados para separação simultânea' +
+        (C().regraSKU ? ', com no máximo uma linha por SKU' : '') +
+        '. O teto é ultrapassado só em dois casos: linha única maior que ele, ou para não abrir um arquivo com menos de ' +
+        (COMUM.MIN_UNIDADES_LOTE).toLocaleString("pt-BR") + ' unidades.') + '</p>' +
     '<div class="lotes">' + gs.map((g,i) => {
       const u = unLote(g), estouro = u > cap;
+      const motivo = !estouro ? "" :
+        (g.length === 1 ? "linha única de " + g[0].qtd.toLocaleString("pt-BR") + " un"
+                        : "absorveu " + (g.estouro || (u - cap)).toLocaleString("pt-BR") +
+                          " un para não abrir arquivo pequeno");
       return '<div class="lote" style="animation-delay:' + (i*45) + 'ms"><div class="n">Arquivo ' + (i+1) + '</div>' +
         '<div class="m">' + g.length + ' linha' + (g.length>1?'s':'') + ' · ' + u.toLocaleString("pt-BR") + ' un</div>' +
-        (estouro ? '<span class="pill w">acima de ' + cap + ' un — linha única de ' +
-          Math.max(...g.map(x=>x.qtd)).toLocaleString("pt-BR") + '</span>' : '') +
+        (estouro ? '<span class="pill w">acima de ' + cap.toLocaleString("pt-BR") + ' un — ' + motivo + '</span>' : '') +
         '<div class="fn">' + nomeArq(env, i, gs.length) + '.csv</div>' +
         '<button class="btn sm dl" data-lote="' + i + '">Baixar ISO-8859-1</button></div>';
     }).join("") + '</div>' +
@@ -1162,10 +1260,12 @@ function detalhe(env){
     '<div id="dl-msg"></div>';
 
   h += '<h3 style="margin:22px 0 10px;font-size:15px">Itens do envio</h3><div class="scroll"><table><thead><tr>' +
-    '<th>Arq.</th><th>SKU</th><th class="num">Un</th>' + (C().regraSKU ? '<th>Código ML</th>' : '') +
+    '<th>Arq.</th><th title="linha na planilha">Linha</th><th>SKU</th><th class="num">Un</th>' +
+    (C().regraSKU ? '<th>Código ML</th>' : '') +
     '<th>Produto</th><th></th></tr></thead><tbody>' +
     gs.flatMap((g,i) => g.map(it =>
-      '<tr><td>' + (i+1) + '</td><td class="mono">' + esc(it.sku) + '</td><td class="num">' + it.qtd + '</td>' +
+      '<tr><td>' + (i+1) + '</td><td class="num" style="color:var(--ink-3)">' + (it.l != null ? it.l : "—") +
+      '</td><td class="mono">' + esc(it.sku) + '</td><td class="num">' + it.qtd + '</td>' +
       (C().regraSKU ? '<td class="mono">' + esc(it.ml) + '</td>' : '') +
       '<td>' + esc(it.desc) + '</td><td>' +
       it.flags.map(f => '<span class="pill ' + f.k + '">' + f.t + '</span>').join(" ") + '</td></tr>')).join("") +
@@ -1364,7 +1464,8 @@ function trocarCanal(novo, semScan){
     canal === "full" ? "#212121" : cfg.cor);
   document.querySelectorAll(".aba").forEach(a => a.setAttribute("aria-selected", String(a.dataset.canal === novo)));
   $("#eyebrow").textContent = cfg.eyebrow;
-  $("#subtitulo").textContent = cfg.sub;
+  /* o teto sai do CONFIG, para o texto nunca contradizer o comportamento */
+  $("#subtitulo").textContent = cfg.sub.replace("{TETO}", COMUM.MAX_UNIDADES_LOTE.toLocaleString("pt-BR"));
   $("#titulo").textContent = "Separador " + (novo === "full" ? "Full" : "Shopee");
   $("#foot-fmt").textContent = "Arquivos: " + cfg.colunas.join(";") + " · ISO-8859-1 · sem BOM · até " +
     COMUM.MAX_UNIDADES_LOTE + " un por arquivo";
